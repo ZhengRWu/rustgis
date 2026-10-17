@@ -1,0 +1,57 @@
+[package]
+name = "rustgis"
+version = "0.2.2"
+edition = "2024"
+description = "RustGIS — 纯 Rust 复刻 ArcGIS 的桌面 GIS 平台：低内存占用、高性能、跨平台"
+license = "MIT OR Apache-2.0"
+repository = "https://example.com/rustgis"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+sys-locale = "0.3"
+# v0.2 数据与渲染
+geo-types = "0.7"
+geojson = "0.24"
+shapefile = { version = "0.9", features = ["encoding_rs", "geo-types"] }
+# common-controls-v6：Windows 下用 ComCtl32 v6 的 TaskDialog 显示消息框，
+# 支持自定义按钮文案（"保存更改"提示的 保存/不保存/取消）。
+# 依赖 build.rs 通过 embed-resource 嵌入 ComCtl32 v6 应用 manifest（resources/）。
+rfd = { version = "0.15", features = ["common-controls-v6"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 空间分析（v0.2.2）：缓冲区几何运算全部走 geo。
+# geo 自带 Buffer（i_overlay 的 stroke/outline：圆角连接 + 圆/方/平端帽）、
+# BooleanOps（融合/挖孔）与基于 earcut 的三角剖分；纯 Rust、无 C 依赖。
+geo = "0.33"
+
+[dev-dependencies]
+# 仅测试用：生成真实 Shapefile 以做端到端导入链路验证（版本与 shapefile 依赖一致）。
+dbase = "0.8"
+
+[target.'cfg(windows)'.build-dependencies]
+# build.rs 用它把 ComCtl32 v6 应用 manifest 嵌入 exe（见 resources/ 与 build.rs）。
+# 仅 Windows 需要：非 Windows 平台没有该构建步骤。
+embed-resource = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# 开发构建也必须能流畅拖图。
+#
+# `cargo run` 走 dev profile，默认 `opt-level = 0`：地图渲染是每帧对几十万顶点
+# 做一次 f64→f32 投影 + 顶点写入的紧循环，未优化时比 release 慢一个数量级
+# （实测 10 万顶点：dev 30.9 ms/帧 = 32 fps，release 9.1 ms/帧 = 110 fps；
+# 200 万顶点：dev 450 ms/帧 = 2.2 fps，release 126 ms/帧 = 8 fps），
+# 表现为"地图不跟鼠标"。
+#
+# 本 crate 取 opt-level = 1：热点循环快数倍，同时保留较快的增量编译；
+# 依赖（egui / epaint / glow 等）取 opt-level = 3：只在首次或依赖变动时编译一次，
+# 后续改本 crate 的代码不会触发依赖重编。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
