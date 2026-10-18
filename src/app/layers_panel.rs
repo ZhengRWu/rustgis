@@ -514,6 +514,12 @@ impl RustGisApp {
             }
             .filter(|b| !b.is_empty())
         };
+        // 只有矢量图层有属性行（QGIS 对栅格另开「Open Raster Attribute Table」，此处不提供）。
+        let is_vector = self
+            .layers
+            .node(id)
+            .and_then(geo::LayerNode::layer)
+            .is_some();
         resp.context_menu(|ui| {
             let zoom_key = if is_group {
                 "layers.zoomToGroup"
@@ -528,6 +534,14 @@ impl RustGisApp {
                 .clicked()
             {
                 self.zoom_to_node(id);
+                ui.close_menu();
+            }
+            if is_vector
+                && ui
+                    .button(RichText::new(self.t("layers.openAttrTable")))
+                    .clicked()
+            {
+                self.open_attr_table(id);
                 ui.close_menu();
             }
             ui.separator();

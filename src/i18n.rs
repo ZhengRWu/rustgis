@@ -264,6 +264,7 @@ fn zh(key: &str) -> &str {
         "layers.root" => "图层",
         "layers.zoomToLayer" => "缩放至图层",
         "layers.zoomToGroup" => "缩放至组",
+        "layers.openAttrTable" => "打开属性表",
         "layers.add" => "添加",
         "layers.addTip" => "添加图层",
         "layers.newGroupTip" => "新建图层组",
@@ -365,6 +366,22 @@ fn zh(key: &str) -> &str {
         // ── 栅格图层（v0.3） ──
         "layers.rasterOpening" => "正在打开栅格…",
         "layers.properties" => "属性…",
+        // ── 属性表（底部停靠面板，工业化样式） ──
+        "attr.title" => "属性表 — {0}",
+        "attr.readOnly" => "只读",
+        "attr.filterHint" => "搜索字段值…",
+        "attr.clear" => "清除筛选",
+        "attr.close" => "关闭属性表",
+        "attr.detach" => "分离为独立窗口",
+        "attr.dock" => "停靠回地图下方",
+        "attr.empty" => "该图层没有属性数据（多由空间分析生成）。",
+        "attr.noMatch" => "没有符合筛选条件的记录。",
+        "attr.fid" => "FID",
+        "attr.footer" => "记录 {0} / {1}    字段 {2}",
+        "attr.selected" => "选中 FID {0}",
+        "attr.zoomToFeature" => "缩放至要素",
+        "attr.copyRow" => "复制整行",
+        "attr.hint" => "双击行缩放至要素",
         "raster.noGeoReference" => {
             "该影像没有地理参考信息，已按像素坐标显示；可在「图层属性 → 范围」中查看详情。"
         }
@@ -392,7 +409,7 @@ fn zh(key: &str) -> &str {
         "toast.dropTitle" => "无法添加文件",
         "toast.dropUnsupported" => {
             "不支持的文件类型：{0}（可拖入 .geojson / .json / .shp / .tif / .tiff，或 Sentinel-2 .SAFE 目录）"
-        },
+        }
         "mapview.dropHint" => "松开鼠标即可添加图层",
         "status.openedWithWarnings" => "已打开工程 {0}（含警告）",
         "props.tab.general" => "常规",
@@ -666,6 +683,7 @@ fn en(key: &str) -> &str {
         "layers.root" => "Layers",
         "layers.zoomToLayer" => "Zoom to Layer",
         "layers.zoomToGroup" => "Zoom to Group",
+        "layers.openAttrTable" => "Open Attribute Table",
         "layers.add" => "Add",
         "layers.addTip" => "Add layer",
         "layers.newGroupTip" => "New group layer",
@@ -773,6 +791,23 @@ fn en(key: &str) -> &str {
         // ── Raster layers (v0.3) ──
         "layers.rasterOpening" => "Opening raster…",
         "layers.properties" => "Properties…",
+        "attr.title" => "Attribute Table — {0}",
+        "attr.readOnly" => "READ-ONLY",
+        "attr.filterHint" => "Search field values…",
+        "attr.clear" => "Clear filter",
+        "attr.close" => "Close attribute table",
+        "attr.detach" => "Detach into a separate window",
+        "attr.dock" => "Dock below the map",
+        "attr.empty" => {
+            "This layer has no attribute data (usually produced by a geoprocessing tool)."
+        }
+        "attr.noMatch" => "No records match the filter.",
+        "attr.fid" => "FID",
+        "attr.footer" => "Records {0} / {1}    Fields {2}",
+        "attr.selected" => "Selected FID {0}",
+        "attr.zoomToFeature" => "Zoom to Feature",
+        "attr.copyRow" => "Copy Row",
+        "attr.hint" => "Double-click a row to zoom to the feature",
         "raster.noGeoReference" => {
             "This image has no georeferencing and is displayed in pixel coordinates; see Layer Properties → Extent for details."
         }
@@ -800,7 +835,7 @@ fn en(key: &str) -> &str {
         "toast.dropTitle" => "Cannot add file",
         "toast.dropUnsupported" => {
             "Unsupported file type: {0} (drop .geojson / .json / .shp / .tif / .tiff, or a Sentinel-2 .SAFE folder)"
-        },
+        }
         "mapview.dropHint" => "Release to add the file as a layer",
         "status.openedWithWarnings" => "Opened project {0} with warnings",
         "props.tab.general" => "General",
@@ -1079,6 +1114,7 @@ fn ja(key: &str) -> &str {
         "layers.root" => "図層",
         "layers.zoomToLayer" => "図層にズーム",
         "layers.zoomToGroup" => "グループにズーム",
+        "layers.openAttrTable" => "属性テーブルを開く",
         "layers.add" => "追加",
         "layers.addTip" => "図層を追加",
         "layers.newGroupTip" => "新規図層グループ",
@@ -1192,6 +1228,21 @@ fn ja(key: &str) -> &str {
         // ── ラスタレイヤ（v0.3） ──
         "layers.rasterOpening" => "ラスタを開いています…",
         "layers.properties" => "プロパティ…",
+        "attr.title" => "属性テーブル — {0}",
+        "attr.readOnly" => "読み取り専用",
+        "attr.filterHint" => "フィールド値を検索…",
+        "attr.clear" => "フィルタをクリア",
+        "attr.close" => "属性テーブルを閉じる",
+        "attr.detach" => "独立ウィンドウに分離",
+        "attr.dock" => "マップ下部にドッキング",
+        "attr.empty" => "このレイヤには属性データがありません（空間解析の結果など）。",
+        "attr.noMatch" => "フィルタに一致するレコードはありません。",
+        "attr.fid" => "FID",
+        "attr.footer" => "レコード {0} / {1}　　フィールド {2}",
+        "attr.selected" => "選択 FID {0}",
+        "attr.zoomToFeature" => "フィーチャにズーム",
+        "attr.copyRow" => "行をコピー",
+        "attr.hint" => "行をダブルクリックでフィーチャにズーム",
         "raster.noGeoReference" => {
             "この画像には地理参照がないため、ピクセル座標で表示しています。詳細は「レイヤプロパティ → 範囲」を参照してください。"
         }
@@ -1219,7 +1270,7 @@ fn ja(key: &str) -> &str {
         "toast.dropTitle" => "ファイルを追加できません",
         "toast.dropUnsupported" => {
             "未対応のファイル形式です：{0}（.geojson / .json / .shp / .tif / .tiff、または Sentinel-2 .SAFE フォルダーをドロップしてください）"
-        },
+        }
         "mapview.dropHint" => "マウスを離すとレイヤーとして追加します",
         "status.openedWithWarnings" => "プロジェクト {0} を開きました（警告あり）",
         "props.tab.general" => "一般",
@@ -1459,6 +1510,7 @@ mod tests {
             "layers.root",
             "layers.zoomToLayer",
             "layers.zoomToGroup",
+            "layers.openAttrTable",
             "layers.add",
             "layers.addTip",
             "layers.newGroupTip",
@@ -1541,6 +1593,22 @@ mod tests {
             "buffer.error.noOutput",
             "buffer.error.busy",
             "buffer.error.noDissolveField",
+            // 属性表（v0.5）
+            "attr.title",
+            "attr.readOnly",
+            "attr.filterHint",
+            "attr.clear",
+            "attr.close",
+            "attr.detach",
+            "attr.dock",
+            "attr.empty",
+            "attr.noMatch",
+            "attr.fid",
+            "attr.footer",
+            "attr.selected",
+            "attr.zoomToFeature",
+            "attr.copyRow",
+            "attr.hint",
             // 栅格图层（v0.3）
             "layers.rasterOpening",
             "layers.properties",

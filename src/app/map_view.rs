@@ -56,12 +56,49 @@ impl RustGisApp {
         );
 
         // 左键拖动平移
-        if response.dragged() {
+        if self.map.tool == map::Tool::Pan && response.dragged_by(egui::PointerButton::Primary) {
             let d = response.drag_delta();
             view.center[0] -= d.x as f64 / view.scale as f64;
             view.center[1] += d.y as f64 / view.scale as f64;
             self.map.view = Some(view);
             self.dirty = true;
+        }
+
+        let mut zoom_box = None;
+        if self.map.tool != map::Tool::Pan {
+            if response.hovered() || response.dragged() {
+                ui.ctx().set_cursor_icon(match self.map.tool {
+                    map::Tool::ZoomIn => egui::CursorIcon::ZoomIn,
+                    _ => egui::CursorIcon::ZoomOut,
+                });
+            }
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                self.map.zoom_drag_start = ui
+                    .input(|i| i.pointer.press_origin())
+                    .filter(|p| rect.contains(*p));
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.map.zoom_drag_start = None;
+            }
+            if let Some(start) = self.map.zoom_drag_start {
+                if let Some(end) = ui.input(|i| i.pointer.latest_pos()) {
+                    let selection = egui::Rect::from_two_pos(start, rect.clamp(end));
+                    if response.drag_stopped_by(egui::PointerButton::Primary) {
+                        if view.zoom_box(rect, selection, self.map.tool == map::Tool::ZoomIn) {
+                            self.map.view = Some(view);
+                            self.dirty = true;
+                        }
+                        self.map.zoom_drag_start = None;
+                    } else {
+                        zoom_box = Some(selection);
+                    }
+                }
+                if !ui.input(|i| i.pointer.primary_down()) {
+                    self.map.zoom_drag_start = None;
+                }
+            }
+        } else {
+            self.map.zoom_drag_start = None;
         }
 
         // 滚轮缩放（以光标为中心）。
@@ -71,6 +108,7 @@ impl RustGisApp {
         // 原实现写成 `1 - 0.12·Δ`（正 delta 缩小），方向正好相反，这就是"缩放搞反了"。
         let scroll = ui.input(|i| i.smooth_scroll_delta);
         if scroll.y.abs() > 1e-3
+            && self.map.zoom_drag_start.is_none()
             && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
             && rect.contains(pos)
         {
@@ -81,7 +119,7 @@ impl RustGisApp {
         }
 
         // 双击缩放至全图
-        if response.double_clicked() {
+        if self.map.tool == map::Tool::Pan && response.double_clicked() {
             view = map::MapView::fit(
                 self.layers
                     .total_bounds_for(self.project_projection.as_ref()),
@@ -131,6 +169,16 @@ impl RustGisApp {
                 &self.layers,
                 &view,
                 self.project_projection.as_ref(),
+            );
+        }
+
+        if let Some(selection) = zoom_box {
+            painter.rect_filled(selection, 0.0, style::ACCENT.gamma_multiply(0.08));
+            painter.rect_stroke(
+                selection,
+                0.0,
+                egui::Stroke::new(1.0_f32, style::ACCENT),
+                egui::StrokeKind::Inside,
             );
         }
 

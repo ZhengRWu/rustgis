@@ -146,6 +146,7 @@ impl RustGisApp {
         self.layers = LayerManager::default();
         self.map.view = None; // 下一帧按默认范围自动适配
         self.zoom_extent = None; // 丢弃旧工程排队的「缩放至图层」
+        self.attr_table = None; // 旧工程的属性表指向已不存在的图层，一并关闭
         self.project_projection = None; // 新工程从"未设置投影"开始
         self.project_path = None;
         self.dirty = false;
@@ -330,6 +331,7 @@ impl RustGisApp {
                     self.layers.replace_with(data.nodes);
                     self.map.view = data.view; // None 时下一帧自动适配
                     self.zoom_extent = None; // 丢弃上一个工程排队的「缩放至图层」
+                    self.attr_table = None; // 属性表关到旧工程的图层上，重新打开前先收起
                     self.project_projection = data.projection; // 旧版本文件 → None（未设置）
                     self.project_path = Some(path);
                     self.dirty = false;

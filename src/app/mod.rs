@@ -2,6 +2,7 @@
 //!
 //! 模块按职责拆分（本文件只保留「应用状态 + 主循环 + 菜单分发」）：
 //! - [`layers_panel`]：左侧「内容列表」（TOC）面板——图层树、拖拽重排、右键菜单；
+//! - [`attr_table`]：底部「属性表」面板——过滤 / 排序 / 缩放至要素（对标 QGIS）；
 //! - [`map_view`]：中央地图视图（平移 / 缩放交互 + 渲染）；
 //! - [`widgets`]：矢量图标与通用小部件（刻意不引入图片资源依赖）；
 //! - [`import`]：图层导入后台流水线（选文件 → 后台解析 / 三角化）；
@@ -15,6 +16,7 @@
 //! （[`ImportStage`](import::ImportStage) / [`ProjectStage`](project_op::ProjectStage)），
 //! 任何时刻都不锁住窗口。
 
+pub mod attr_table;
 pub mod buffer_dialog;
 pub mod geoprocess_dialog;
 pub mod import;
@@ -25,6 +27,7 @@ pub mod raster_dialog;
 pub mod raster_op;
 pub mod toast;
 pub mod widgets;
+mod toolbar;
 
 use std::path::PathBuf;
 
@@ -122,6 +125,10 @@ pub struct RustGisApp {
     /// 右键菜单回调里拿不到地图控件的精确像素矩形，故与 `needs_fit` 一样延迟到
     /// 下一帧的地图面板里消费。
     zoom_extent: Option<Aabb>,
+    /// 底部「属性表」面板（`Some` 时显示；仅矢量图层可打开）。
+    ///
+    /// 打开时记图层 id，图层被移除或工程被替换后自动关闭。
+    attr_table: Option<attr_table::AttrTable>,
     /// 鼠标在地图区域内的世界坐标（状态栏显示）。
     cursor_world: Option<[f64; 2]>,
     /// 正在被拖拽的图层（`Some` 时只画落点指示器；真正的移动在鼠标松开时才发生）。
@@ -206,6 +213,7 @@ impl RustGisApp {
             map_rect: None,
             needs_fit: false,
             zoom_extent: None,
+            attr_table: None,
             cursor_world: None,
             layer_drag: None,
             project_projection: None,
@@ -449,6 +457,11 @@ impl eframe::App for RustGisApp {
                 menus::show_menu_bar(ui, self);
             });
 
+        TopBottomPanel::top("classic_toolbars")
+            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(245, 245, 245))
+                .inner_margin(egui::Margin::symmetric(4, 1)))
+            .show(ctx, |ui| self.show_toolbars(ui));
+
         // 左侧图层管理面板（对标 ArcGIS 图层窗口位置）
         SidePanel::left("layers_panel")
             .min_width(200.0)
@@ -500,6 +513,9 @@ impl eframe::App for RustGisApp {
                     ui.weak(self.status_meta_text());
                 });
             });
+
+        // 底部「属性表」面板：叠在状态栏之上、抢占地图下方的空间（对标 QGIS 停靠属性表）。
+        self.show_attr_table(ctx);
 
         // 中央地图视图
         CentralPanel::default().show(ctx, |ui| self.map_panel(ui));

@@ -465,6 +465,41 @@ impl Layer {
         }
     }
 
+    /// 单个要素（属性表行号）在**源 CRS** 下的包围盒。
+    ///
+    /// 属性表「缩放至要素」用它取目标范围；行号 → 几何的映射沿用
+    /// `point_rows` / `line_rows` / `ring_rows`（批量结果图层没有映射时返回 `None`）。
+    /// 孔环一定落在外环内部，不影响包围盒，故只统计外环。
+    pub fn feature_bounds(&self, row: usize) -> Option<Aabb> {
+        let mut bounds = Aabb::empty();
+        for (i, &r) in self.point_rows.iter().enumerate() {
+            if r == row
+                && let Some(p) = self.points.get(i)
+            {
+                bounds.extend_point(*p);
+            }
+        }
+        for (i, &r) in self.line_rows.iter().enumerate() {
+            if r == row
+                && let Some(line) = self.lines.get(i)
+            {
+                for p in line {
+                    bounds.extend_point(*p);
+                }
+            }
+        }
+        for (i, &r) in self.ring_rows.iter().enumerate() {
+            if r == row
+                && let Some(ring) = self.outer_rings.get(i)
+            {
+                for p in ring {
+                    bounds.extend_point(*p);
+                }
+            }
+        }
+        (!bounds.is_empty()).then_some(bounds)
+    }
+
     fn from_parts(name: String, parts: Vec<Part>) -> Layer {
         let mut layer = Layer {
             name,

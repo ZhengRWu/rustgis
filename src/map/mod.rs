@@ -16,10 +16,12 @@ pub struct MapView {
     pub scale: f32,
 }
 
-/// 交互工具。v0.2 仅平移（选择工具留待 v0.3）。
+/// 地图鼠标交互工具。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Pan,
+    ZoomIn,
+    ZoomOut,
 }
 
 /// 地图交互总状态。
@@ -28,6 +30,7 @@ pub struct MapState {
     /// None 表示尚未初始化（首次渲染时按图层范围或默认视图设置）。
     pub view: Option<MapView>,
     pub tool: Tool,
+    pub zoom_drag_start: Option<Pos2>,
 }
 
 impl Default for MapState {
@@ -35,11 +38,41 @@ impl Default for MapState {
         Self {
             view: None,
             tool: Tool::Pan,
+            zoom_drag_start: None,
         }
     }
 }
 
 impl MapView {
+    /// 框选放大使框内范围适配视口；框选缩小将当前视口缩进选框。
+    /// 忽略点击和过窄的框，避免产生极端缩放。
+    pub fn zoom_box(&mut self, viewport: Rect, selection: Rect, zoom_in: bool) -> bool {
+        let selection = selection.intersect(viewport);
+        if viewport.width() < 8.0
+            || viewport.height() < 8.0
+            || selection.width() < 4.0
+            || selection.height() < 4.0
+        {
+            return false;
+        }
+        let ratio =
+            (selection.width() / viewport.width()).max(selection.height() / viewport.height());
+        if zoom_in {
+            self.center = world_at(selection.center(), viewport, self);
+            self.zoom_center(1.0 / ratio);
+        } else {
+            let old_center = self.center;
+            self.zoom_center(
+                (selection.width() / viewport.width()).min(selection.height() / viewport.height()),
+            );
+            let offset = selection.center() - viewport.center();
+            self.center = [
+                old_center[0] - f64::from(offset.x) / f64::from(self.scale),
+                old_center[1] + f64::from(offset.y) / f64::from(self.scale),
+            ];
+        }
+        true
+    }
     /// 适配到给定包围盒（留 10% 边距）；无数据时使用默认视图（中国范围）。
     pub fn fit(bounds: Option<Aabb>, rect: Rect) -> MapView {
         match bounds {
@@ -181,6 +214,53 @@ impl Projector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn box_zoom_fits_selected_extent_and_preserves_aspect_ratio() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let selection =
+            egui::Rect::from_two_pos(egui::pos2(100.0, 100.0), egui::pos2(300.0, 200.0));
+        let mut view = super::MapView {
+            center: [0.0, 0.0],
+            scale: 10.0,
+        };
+        let center = super::world_at(selection.center(), viewport, &view);
+        assert!(view.zoom_box(viewport, selection, true));
+        assert_eq!(view.center, center);
+        assert_eq!(view.scale, 40.0);
+    }
+
+    #[test]
+    fn box_zoom_out_places_old_view_inside_selection() {
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let selection =
+            egui::Rect::from_two_pos(egui::pos2(100.0, 100.0), egui::pos2(300.0, 200.0));
+        let mut view = super::MapView {
+            center: [0.0, 0.0],
+            scale: 12.0,
+        };
+        let corners = [viewport.left_top(), viewport.right_bottom()]
+            .map(|p| super::world_at(p, viewport, &view));
+        assert!(view.zoom_box(viewport, selection, false));
+        assert_eq!(view.scale, 2.0);
+        assert_eq!(
+            super::world_to_screen([0.0, 0.0], viewport, &view),
+            selection.center()
+        );
+        for corner in corners {
+            assert!(
+                selection
+                    .expand(0.001)
+                    .contains(super::world_to_screen(corner, viewport, &view))
+            );
+        }
+        let previous = view;
+        assert!(!view.zoom_box(
+            viewport,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 50.0)),
+            true
+        ));
+        assert_eq!(view, previous);
+    }
     use super::*;
 
     #[test]
