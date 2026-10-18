@@ -3,7 +3,7 @@
 pub mod render;
 pub mod simplify;
 
-use egui::{pos2, Pos2, Rect};
+use egui::{Pos2, Rect, pos2};
 
 use crate::geo::Aabb;
 
@@ -46,9 +46,7 @@ impl MapView {
             Some(b) if !b.is_empty() => {
                 let w = b.width().max(1e-9);
                 let h = b.height().max(1e-9);
-                let scale = ((rect.width() as f64 / w)
-                    .min(rect.height() as f64 / h)
-                    * 0.9)
+                let scale = ((rect.width() as f64 / w).min(rect.height() as f64 / h) * 0.9)
                     .clamp(1e-6, 1e6) as f32;
                 MapView {
                     center: b.center(),
@@ -235,12 +233,7 @@ mod tests {
             },
         ] {
             let proj = Projector::new(rect, &view);
-            for w in [
-                [116.0, 40.5],
-                [117.3, 39.1],
-                [-74.5, 41.2],
-                [180.0, -85.0],
-            ] {
+            for w in [[116.0, 40.5], [117.3, 39.1], [-74.5, 41.2], [180.0, -85.0]] {
                 let a = world_to_screen(w, rect, &view);
                 let b = proj.project(w);
                 assert!((a.x - b.x).abs() < 1e-3, "{a:?} vs {b:?}");
@@ -263,10 +256,7 @@ mod tests {
 
     /// 测试用：直接用 `Projector` 的仿射系数反解屏幕点（等价于 `world_at`）。
     fn world_from_screen_raw(sx: f64, sy: f64, p: &Projector) -> (f64, f64) {
-        (
-            (sx - p.bx) / p.kx,
-            (sy - p.by) / p.ky,
-        )
+        ((sx - p.bx) / p.kx, (sy - p.by) / p.ky)
     }
 
     #[test]

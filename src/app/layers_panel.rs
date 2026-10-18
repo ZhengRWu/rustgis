@@ -8,7 +8,10 @@
 //! `Context` 跑了完整的布局与拖拽时序回归，改动本文件后必须先过那些测试。
 //! 基础图标（加号 / 文件夹 / 折叠框 / 勾选框等）在 [`super::widgets`]。
 
-use egui::{Align2, Color32, FontId, PointerButton, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{
+    Align2, Color32, FontId, PointerButton, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui,
+    Vec2,
+};
 
 use crate::geo;
 use crate::style;
@@ -86,6 +89,28 @@ fn draw_legend_symbol(painter: &egui::Painter, rect: Rect, row: &Row) {
         Some(geo::LegendKind::Point) => {
             painter.circle_filled(rect.center(), row.point_radius, row.point_color);
         }
+        Some(geo::LegendKind::Raster) => {
+            // 栅格用「彩色小方格」示意：左红右绿，中间一小片蓝，贴近 RGB 合成观感。
+            let third = rect.width() / 3.0;
+            let left = Rect::from_min_size(rect.min, Vec2::new(third, rect.height()));
+            let mid = Rect::from_min_size(
+                Pos2::new(rect.min.x + third, rect.min.y),
+                Vec2::new(third, rect.height()),
+            );
+            let right = Rect::from_min_size(
+                Pos2::new(rect.min.x + third * 2.0, rect.min.y),
+                Vec2::new(third, rect.height()),
+            );
+            painter.rect_filled(left, 0.0, Color32::from_rgb(198, 92, 74));
+            painter.rect_filled(mid, 0.0, Color32::from_rgb(96, 158, 92));
+            painter.rect_filled(right, 0.0, Color32::from_rgb(84, 110, 168));
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0_f32, style::GROUP_ICON),
+                StrokeKind::Inside,
+            );
+        }
         None => draw_group_icon(painter, rect, style::GROUP_ICON),
     }
 }
@@ -138,15 +163,14 @@ fn draw_drop_indicator(
 ) {
     let line = |r: Rect, y: f32| {
         painter.line_segment(
-            [
-                Pos2::new(r.min.x + 10.0, y),
-                Pos2::new(r.max.x - 10.0, y),
-            ],
+            [Pos2::new(r.min.x + 10.0, y), Pos2::new(r.max.x - 10.0, y)],
             Stroke::new(2.0_f32, style::ACCENT),
         );
     };
     // 「插在该位置」对应的锚行：兄弟位置就是那一行本身，「组最上层」是组的首个子行。
-    let anchor = metas.iter().find(|m| m.parent == parent && m.index == index);
+    let anchor = metas
+        .iter()
+        .find(|m| m.parent == parent && m.index == index);
     match (anchor, parent) {
         (Some(row), _) => line(row.rect, row.rect.min.y + 1.0),
         (None, Some(pid)) => {
@@ -192,6 +216,8 @@ impl RustGisApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 导入进行中：工具条置灰并显示当前阶段提示。
                 if let Some(key) = self.import_hint() {
+                    ui.weak(self.t(key));
+                } else if let Some(key) = self.raster_import_hint() {
                     ui.weak(self.t(key));
                 }
                 let idle = self.project_idle();
@@ -269,10 +295,8 @@ impl RustGisApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // ── 根节点「图层」：对应截图里的数据框（不参与勾选 / 拖拽） ──
-                let (rect, _) = ui.allocate_exact_size(
-                    Vec2::new(ui.available_width(), ROW_H),
-                    Sense::hover(),
-                );
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::hover());
                 root_rect = rect;
                 ui.painter().rect_filled(rect, 0.0, style::SOFT_BG);
                 let cy = rect.center().y;
@@ -293,12 +317,11 @@ impl RustGisApp {
                     ui.add_space(10.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.add_space(10.0);
-                        ui.label(RichText::new(self.t("layers.empty")).weak().small());
+                        ui.label(RichText::new(self.t("layers.empty")).small());
                     });
                 } else {
                     for row in rows.iter() {
-                        let (still_dragging, just_stopped) =
-                            self.layer_row(ui, row, &mut metas);
+                        let (still_dragging, just_stopped) = self.layer_row(ui, row, &mut metas);
                         drag_continued |= still_dragging;
                         drag_stopped_here |= just_stopped;
                     }
@@ -335,18 +358,28 @@ impl RustGisApp {
                     .iter()
                     .find(|m| m.id == drag_id)
                     .map(|m| (m.parent, m.index));
-                if current != Some((parent, index))
-                    && self.layers.move_node(drag_id, parent, index)
+                if current != Some((parent, index)) && self.layers.move_node(drag_id, parent, index)
                 {
                     self.dirty = true;
                 }
             }
             self.layer_drag = None;
         }
+    }
 
-        ui.separator();
-        ui.label(RichText::new(self.t("layers.dragHint")).weak().small());
-        ui.label(RichText::new(self.t("map.hint")).weak().small());
+    /// 缩放至节点范围（右键「缩放至图层 / 缩放至组」，对标 QGIS 的 Zoom to Layer）。
+    ///
+    /// 这里只排队、不立刻改视图：右键菜单位于内容列表面板内，拿不到地图控件的
+    /// 精确像素矩形，下一帧由 `map_view::map_panel` 用实际矩形调用 `MapView::fit`。
+    fn zoom_to_node(&mut self, id: u64) {
+        let Some(bounds) = self.layers.node(id).map(geo::LayerNode::bounds) else {
+            return;
+        };
+        if bounds.is_empty() {
+            return;
+        }
+        self.zoom_extent = Some(bounds);
+        self.dirty = true;
     }
 
     /// 绘制内容列表的一行，并处理它的点击 / 拖拽 / 右键菜单。
@@ -356,12 +389,7 @@ impl RustGisApp {
     ///
     /// 返回 `(拖拽仍在继续, 拖拽刚在本行结束)`——被拖行的 Response 才能报告这两件事，
     /// 而落点结算需要整棵树的 `metas`，所以只在这里取信号、由 `layers_panel` 统一结算。
-    fn layer_row(
-        &mut self,
-        ui: &mut Ui,
-        row: &Row,
-        metas: &mut Vec<RowMeta>,
-    ) -> (bool, bool) {
+    fn layer_row(&mut self, ui: &mut Ui, row: &Row, metas: &mut Vec<RowMeta>) -> (bool, bool) {
         let selected = self.layers.selected_id() == Some(row.id);
         let dragged = self.layer_drag == Some(row.id);
         let (row_rect, resp) = ui.allocate_exact_size(
@@ -417,16 +445,17 @@ impl RustGisApp {
         );
         draw_legend_symbol(ui.painter(), glyph_rect, row);
 
-        // 名称：自身或祖先未勾选的节点用弱文字色提示"当前不绘制"。
-        let text_color = if row.visible && row.ancestors_visible {
-            style::TEXT
-        } else {
-            style::TEXT_WEAK
-        };
+        // 名称：全应用文字统一纯黑；是否绘制由勾选框状态表达。
+        let text_color = style::TEXT;
         // 与顶部菜单栏同字体（组与图层不再区分字号）。
         let font = menu_bar_font(ui.style());
-        ui.painter()
-            .text(Pos2::new(text_x, cy), Align2::LEFT_CENTER, &row.name, font, text_color);
+        ui.painter().text(
+            Pos2::new(text_x, cy),
+            Align2::LEFT_CENTER,
+            &row.name,
+            font,
+            text_color,
+        );
 
         metas.push(RowMeta {
             id: row.id,
@@ -452,17 +481,53 @@ impl RustGisApp {
             self.layers.select(row.id);
             self.layer_drag = Some(row.id);
         }
+        // 双击栅格图层：打开「图层属性」对话框（对标 ArcGIS 双击图层）。
+        if resp.double_clicked() && !row.is_group {
+            self.layers.select(row.id);
+            self.open_raster_props(row.id);
+        }
         // 注意：`layer_drag` 不在这里清——清与结算都放在 `layers_panel` 的树循环之后，
         // 那里才拿得到完整的 `metas` 来算松手落点。
         let drag_continued = dragged && resp.dragged();
         let drag_stopped_here = dragged && resp.drag_stopped();
 
-        // ── 右键菜单：显示 / 隐藏、新建子组、移出组、删除 ──
+        // ── 右键菜单：缩放至图层 / 组、显示 / 隐藏、新建子组、移出组、删除 ──
         let visible = row.visible;
         let is_group = row.is_group;
         let inside_group = row.parent.is_some();
         let id = row.id;
+        // 与 QGIS 一致（`setEnabled(layer->isValid())`）：空组、无几何或无地理参考的
+        // 图层没有有效范围，菜单项禁用而不是缩放到默认的全图范围。
+        let node_bounds = self
+            .layers
+            .node(id)
+            .map(geo::LayerNode::bounds)
+            .filter(|b| !b.is_empty());
         resp.context_menu(|ui| {
+            let zoom_key = if is_group {
+                "layers.zoomToGroup"
+            } else {
+                "layers.zoomToLayer"
+            };
+            if ui
+                .add_enabled(
+                    node_bounds.is_some(),
+                    egui::Button::new(RichText::new(self.t(zoom_key))),
+                )
+                .clicked()
+            {
+                self.zoom_to_node(id);
+                ui.close_menu();
+            }
+            ui.separator();
+            if !is_group
+                && ui
+                    .button(RichText::new(self.t("layers.properties")))
+                    .clicked()
+            {
+                self.open_raster_props(id);
+                ui.close_menu();
+            }
             if ui
                 .button(RichText::new(self.t(if visible {
                     "layers.hide"
@@ -475,23 +540,33 @@ impl RustGisApp {
                 self.dirty = true;
                 ui.close_menu();
             }
-            if is_group && ui.button(RichText::new(self.t("layers.newGroupHere"))).clicked() {
+            if is_group
+                && ui
+                    .button(RichText::new(self.t("layers.newGroupHere")))
+                    .clicked()
+            {
                 let name = self.layers.unique_name(self.t("layers.newGroupName"));
                 self.layers.select(id); // 让新组落进当前组
                 self.layers.add_group(name);
                 self.dirty = true;
                 ui.close_menu();
             }
-            if inside_group && ui.button(RichText::new(self.t("layers.moveToTop"))).clicked() {
+            if inside_group
+                && ui
+                    .button(RichText::new(self.t("layers.moveToTop")))
+                    .clicked()
+            {
                 self.layers.move_node(id, None, 0);
                 self.dirty = true;
                 ui.close_menu();
             }
             ui.separator();
             if ui
-                .button(RichText::new(self.t("layers.delete")).color(style::DANGER))
+                .button(RichText::new(self.t("layers.remove")).color(style::DANGER))
                 .clicked()
             {
+                // 栅格图层正在做统计 / 金字塔：先取消后台任务再移除节点。
+                self.cancel_raster_job(id);
                 self.layers.remove(id);
                 self.layer_drag = None;
                 self.dirty = true;
@@ -581,7 +656,10 @@ mod tests {
             },
         ];
         assert_eq!(drop_target(root, &metas, root.center()), Some((None, 0)));
-        assert_eq!(drop_target(root, &metas, row(ROW_H).center()), Some((Some(7), 0)));
+        assert_eq!(
+            drop_target(root, &metas, row(ROW_H).center()),
+            Some((Some(7), 0))
+        );
         assert_eq!(
             drop_target(root, &metas, row(ROW_H * 2.0).center()),
             Some((Some(7), 3))
@@ -672,7 +750,11 @@ mod tests {
         let y_b = y_b.expect("「b」行应能被点选到");
 
         // 1) 在 b 行按下：还没移动，不算拖拽。
-        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(y_b), press_event(y_b)]);
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(y_b), press_event(y_b)],
+        );
         assert_eq!(app.layer_drag, None, "刚按下、未移动时不应进入拖拽");
 
         // 2) 移到 a 行（位移超过点击阈值）⇒ 进入拖拽；但树必须纹丝不动。
@@ -689,5 +771,80 @@ mod tests {
         frame(&ctx, &mut app, vec![release_event(y_a)]);
         assert_eq!(app.layer_drag, None, "松开后拖拽状态应被清理");
         assert_eq!(toc_names(&app), vec!["b", "a"], "松开后 b 应移到 a 之前");
+    }
+
+    /// 无头跑一帧中央地图面板（视图适配逻辑所在的位置）。
+    fn map_frame(ctx: &egui::Context, app: &mut RustGisApp) {
+        let _ = ctx.run(headless_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.map_panel(ui));
+        });
+    }
+
+    /// 在 `(x, y)` 处造一个 1×1 的多边形图层。
+    fn square_layer(name: &str, x: f64, y: f64) -> geo::Layer {
+        geo::Layer::from_geometry(
+            name.to_string(),
+            Vec::new(),
+            Vec::new(),
+            vec![geo::PolygonData {
+                outer: vec![
+                    [x, y],
+                    [x + 1.0, y],
+                    [x + 1.0, y + 1.0],
+                    [x, y + 1.0],
+                    [x, y],
+                ],
+                holes: Vec::new(),
+            }],
+        )
+    }
+
+    /// 右键「缩放至图层」：排队的是该节点（组为子树并集）的范围，
+    /// 空组没有范围时不排队、也不把工程标脏。
+    #[test]
+    fn zoom_to_node_queues_node_bounds() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::new(&ctx);
+
+        let group = app.layers.add_group("组".to_string());
+        let a = app.layers.add(sample_layer("a"));
+        app.layers.move_node(a, Some(group), 0);
+
+        app.zoom_to_node(group);
+        let queued = app.zoom_extent.expect("组应有待缩放的子树并集范围");
+        assert_eq!(queued, app.layers.node(a).unwrap().bounds());
+        assert!(app.dirty, "视图操作应把工程标脏");
+
+        // 空组：没有有效范围，菜单项在界面上是禁用的，这里再兜一层。
+        app.zoom_extent = None;
+        app.dirty = false;
+        let empty = app.layers.add_group("空组".to_string());
+        app.zoom_to_node(empty);
+        assert_eq!(app.zoom_extent, None);
+        assert!(!app.dirty);
+    }
+
+    /// 排队范围在下一帧被地图面板消费：视图中心落在该图层范围中心，
+    /// 而不是全部图层的总范围中心。
+    #[test]
+    fn zoom_extent_is_applied_next_map_frame() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::new(&ctx);
+        let near = app.layers.add(sample_layer("near")); // 范围 [0,0]-[1,1]
+        app.layers.add(square_layer("far", 100.0, 100.0));
+
+        map_frame(&ctx, &mut app); // 首帧自动适配全部数据
+        let total = app.map.view.expect("首帧后应有视图");
+        assert!(total.center[0] > 50.0, "首帧应对齐全图总范围");
+
+        app.zoom_to_node(near);
+        assert!(app.zoom_extent.is_some());
+        map_frame(&ctx, &mut app);
+
+        assert_eq!(app.zoom_extent, None, "适配后应清空排队范围");
+        let view = app.map.view.expect("应有视图");
+        assert!((view.center[0] - 0.5).abs() < 1e-9, "{:?}", view.center);
+        assert!((view.center[1] - 0.5).abs() < 1e-9, "{:?}", view.center);
+        assert!(view.scale > 0.0);
     }
 }

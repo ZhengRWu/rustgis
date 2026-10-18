@@ -19,6 +19,7 @@ use egui::Color32;
 use geo_types::Geometry;
 
 use crate::geo::tri::triangulate_polygons;
+use crate::raster::{RasterDisplay, RasterLayer};
 use crate::style;
 
 /// 2D 坐标（x=经度/东，y=纬度/北）。
@@ -147,13 +148,15 @@ pub fn parse_prj_wkt(wkt: &str) -> ProjectionInfo {
         ProjectionModel::Unknown
     };
 
-    let crs = parse_epsg_authority(wkt).map(CrsId::Epsg).unwrap_or_else(|| {
-        if model == ProjectionModel::Unknown || name.is_empty() {
-            CrsId::None
-        } else {
-            CrsId::Name(name)
-        }
-    });
+    let crs = parse_epsg_authority(wkt)
+        .map(CrsId::Epsg)
+        .unwrap_or_else(|| {
+            if model == ProjectionModel::Unknown || name.is_empty() {
+                CrsId::None
+            } else {
+                CrsId::Name(name)
+            }
+        });
 
     ProjectionInfo { model, crs }
 }
@@ -181,15 +184,13 @@ fn parse_epsg_authority(wkt: &str) -> Option<u32> {
             ']' if !in_name => depth -= 1,
             'A' if !in_name && wkt[i..].starts_with(PAT) => {
                 let rest = &wkt[i + PAT.len()..];
-                let digits: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(code) = digits.parse::<u32>() {
                     // 深度浅者优先；同深度取后出现的。
-                    if best.as_ref().is_none_or(|(bd, bp, _)| {
-                        depth < *bd || (depth == *bd && i >= *bp)
-                    }) {
+                    if best
+                        .as_ref()
+                        .is_none_or(|(bd, bp, _)| depth < *bd || (depth == *bd && i >= *bp))
+                    {
                         best = Some((depth, i, code));
                     }
                 }
@@ -302,6 +303,17 @@ impl Aabb {
             && other.min[1] <= self.max[1]
     }
 
+    /// 两个包围盒的交集；不相交时返回空盒。
+    pub fn intersect(&self, other: &Aabb) -> Aabb {
+        if !self.intersects(other) {
+            return Aabb::empty();
+        }
+        Aabb {
+            min: [self.min[0].max(other.min[0]), self.min[1].max(other.min[1])],
+            max: [self.max[0].min(other.max[0]), self.max[1].min(other.max[1])],
+        }
+    }
+
     /// 点是否落在盒内（含边界）。
     pub fn contains_point(&self, p: Coord2D) -> bool {
         self.min[0] <= p[0] && p[0] <= self.max[0] && self.min[1] <= p[1] && p[1] <= self.max[1]
@@ -346,6 +358,8 @@ pub enum LegendKind {
     Line,
     /// 点要素：圆点。
     Point,
+    /// 栅格：小方格（带渐变，示意符号系统）。
+    Raster,
 }
 
 /// 图层渲染样式。
@@ -583,6 +597,8 @@ pub struct Group {
 pub enum LayerNode {
     Group(Group),
     Layer(Layer),
+    /// 栅格图层：像素按需读取（`Arc<Mutex<RasterDataset>>`），克隆代价低。
+    Raster(RasterLayer),
 }
 
 impl LayerNode {
@@ -590,6 +606,7 @@ impl LayerNode {
         match self {
             Self::Group(g) => g.id,
             Self::Layer(l) => l.id,
+            Self::Raster(r) => r.id,
         }
     }
 
@@ -597,6 +614,7 @@ impl LayerNode {
         match self {
             Self::Group(g) => &g.name,
             Self::Layer(l) => &l.name,
+            Self::Raster(r) => &r.name,
         }
     }
 
@@ -604,6 +622,16 @@ impl LayerNode {
         match self {
             Self::Group(g) => g.visible,
             Self::Layer(l) => l.visible,
+            Self::Raster(r) => r.visible,
+        }
+    }
+
+    /// 重命名节点（「图层属性 → 常规」里的名称输入框）。
+    pub fn set_name(&mut self, name: String) {
+        match self {
+            Self::Group(g) => g.name = name,
+            Self::Layer(l) => l.name = name,
+            Self::Raster(r) => r.name = name,
         }
     }
 
@@ -611,6 +639,7 @@ impl LayerNode {
         match self {
             Self::Group(g) => g.visible = visible,
             Self::Layer(l) => l.visible = visible,
+            Self::Raster(r) => r.visible = visible,
         }
     }
 
@@ -639,7 +668,7 @@ impl LayerNode {
     pub fn children(&self) -> &[LayerNode] {
         match self {
             Self::Group(g) => &g.children,
-            Self::Layer(_) => &[],
+            Self::Layer(_) | Self::Raster(_) => &[],
         }
     }
 
@@ -647,26 +676,64 @@ impl LayerNode {
     pub fn children_mut(&mut self) -> Option<&mut Vec<LayerNode>> {
         match self {
             Self::Group(g) => Some(&mut g.children),
-            Self::Layer(_) => None,
+            Self::Layer(_) | Self::Raster(_) => None,
         }
     }
 
     pub fn layer(&self) -> Option<&Layer> {
         match self {
             Self::Layer(l) => Some(l),
-            Self::Group(_) => None,
+            Self::Group(_) | Self::Raster(_) => None,
+        }
+    }
+
+    /// 栅格图层（矢量图层与组返回 `None`）。
+    pub fn raster(&self) -> Option<&RasterLayer> {
+        match self {
+            Self::Raster(r) => Some(r),
+            Self::Group(_) | Self::Layer(_) => None,
+        }
+    }
+
+    pub fn raster_mut(&mut self) -> Option<&mut RasterLayer> {
+        match self {
+            Self::Raster(r) => Some(r),
+            Self::Group(_) | Self::Layer(_) => None,
         }
     }
 
     /// 叶子图层的图例符号类型（组返回 `None`）。
     pub fn legend_kind(&self) -> Option<LegendKind> {
-        self.layer().map(Layer::legend_kind)
+        match self {
+            Self::Layer(l) => Some(l.legend_kind()),
+            Self::Raster(_) => Some(LegendKind::Raster),
+            Self::Group(_) => None,
+        }
+    }
+
+    /// 节点自身（组则为整个子树）的世界坐标包围盒。
+    ///
+    /// 对标 QGIS 的 `Zoom to Layer` / `Zoom to Group`：组取其全部后代图层范围的
+    /// 并集（QGIS 的 `zoomToGroup` 也是收集组内所有图层的范围），栅格与矢量同等对待。
+    /// 没有任何几何 / 无地理参考的图层可能得到空盒，调用方据此禁用菜单项。
+    pub fn bounds(&self) -> Aabb {
+        let mut union = Aabb::empty();
+        match self {
+            Self::Layer(l) => union.merge(l.bounds),
+            Self::Raster(r) => union.merge(r.bounds),
+            Self::Group(g) => {
+                for child in &g.children {
+                    union.merge(child.bounds());
+                }
+            }
+        }
+        union
     }
 
     /// 子树中是否含有至少一个叶子图层（空组不算）。
     fn has_layers(&self) -> bool {
         match self {
-            Self::Layer(_) => true,
+            Self::Layer(_) | Self::Raster(_) => true,
             Self::Group(g) => g.children.iter().any(LayerNode::has_layers),
         }
     }
@@ -753,6 +820,17 @@ impl LayerManager {
         id
     }
 
+    /// 加入一个栅格图层，返回新图层 id。选中项是组时会自动放进该组。
+    pub fn add_raster(&mut self, mut layer: RasterLayer) -> u64 {
+        layer.id = self.take_id();
+        let id = layer.id;
+        let (parent, index) = self.insertion_point();
+        self.selected = Some(id);
+        let _ = insert_node(&mut self.roots, parent, index, LayerNode::Raster(layer));
+        self.bump();
+        id
+    }
+
     /// 新建图层组（名称由调用方按当前语言给出），返回新组 id。
     pub fn add_group(&mut self, name: String) -> u64 {
         let (parent, index) = self.insertion_point();
@@ -778,6 +856,29 @@ impl LayerManager {
         push_visible_leaves(&self.roots, true, &mut out);
         out.reverse();
         out.into_iter()
+    }
+
+    /// 自底向上的可见栅格图层（与 [`Self::iter_visible`] 同一顺序）。
+    pub fn iter_visible_rasters(&self) -> impl Iterator<Item = &RasterLayer> {
+        let mut out = Vec::new();
+        push_visible_rasters(&self.roots, true, &mut out);
+        out.reverse();
+        out.into_iter()
+    }
+
+    /// 可写节点访问（栅格图层改符号系统、矢量图层改样式时用）。
+    pub fn node_mut(&mut self, id: u64) -> Option<&mut LayerNode> {
+        find_node_mut(&mut self.roots, id)
+    }
+
+    /// 更新栅格图层的符号系统并递增渲染版本号。
+    pub fn set_raster_display(&mut self, id: u64, display: RasterDisplay) {
+        if let Some(node) = find_node_mut(&mut self.roots, id)
+            && let Some(raster) = node.raster_mut()
+        {
+            raster.display = display;
+            self.bump();
+        }
     }
 
     /// 内容列表的行（前序；折叠的组不展开其子节点）。
@@ -881,17 +982,16 @@ impl LayerManager {
         self.roots.iter().any(|n| any_name_eq(n, name))
     }
 
-    /// 全部有效可见层级的联合包围盒。
+    /// 全部有效可见层级的联合包围盒（矢量 + 栅格）。
     pub fn total_bounds(&self) -> Option<Aabb> {
         let mut union = Aabb::empty();
         for layer in self.iter_visible() {
             union.merge(layer.bounds);
         }
-        if union.is_empty() {
-            None
-        } else {
-            Some(union)
+        for raster in self.iter_visible_rasters() {
+            union.merge(raster.bounds);
         }
+        if union.is_empty() { None } else { Some(union) }
     }
 }
 
@@ -910,6 +1010,27 @@ fn push_visible_leaves<'a>(nodes: &'a [LayerNode], parent_visible: bool, out: &m
                 }
             }
             LayerNode::Group(g) => push_visible_leaves(&g.children, visible, out),
+            LayerNode::Raster(_) => {}
+        }
+    }
+}
+
+/// 面板顺序收集"有效可见"的栅格图层。
+fn push_visible_rasters<'a>(
+    nodes: &'a [LayerNode],
+    parent_visible: bool,
+    out: &mut Vec<&'a RasterLayer>,
+) {
+    for node in nodes {
+        let visible = parent_visible && node.visible();
+        match node {
+            LayerNode::Raster(r) => {
+                if visible {
+                    out.push(r);
+                }
+            }
+            LayerNode::Group(g) => push_visible_rasters(&g.children, visible, out),
+            LayerNode::Layer(_) => {}
         }
     }
 }
@@ -1048,6 +1169,10 @@ fn renumber(node: &mut LayerNode, next: &mut u64) {
             l.id = *next;
             *next += 1;
         }
+        LayerNode::Raster(r) => {
+            r.id = *next;
+            *next += 1;
+        }
     }
 }
 
@@ -1081,8 +1206,8 @@ pub fn load_file(path: &Path) -> Result<Layer, String> {
         }
         other => {
             return Err(format!(
-                "不支持的文件格式：.{other}（支持 .geojson / .json / .shp）"
-            ))
+                "不支持的文件格式：.{other}（矢量支持 .geojson / .json / .shp；栅格请用「插入 → 添加栅格图层」或「添加数据」选 .tif / .tiff）"
+            ));
         }
     };
     if parts.is_empty() {
@@ -1179,11 +1304,7 @@ fn json_value_to_string(value: &serde_json::Value) -> String {
 ///
 /// `attrs` 是该要素的属性副本：Multi* / GeometryCollection 展开出的每个 Part
 /// 都带同一份（属性行号即要素序号，FID 由行号承担，不另造字段）。
-fn expand_geojson_value(
-    value: geojson::Value,
-    attrs: &[(String, String)],
-    parts: &mut Vec<Part>,
-) {
+fn expand_geojson_value(value: geojson::Value, attrs: &[(String, String)], parts: &mut Vec<Part>) {
     match value {
         geojson::Value::Point(p) => {
             if let Some(c) = coord2d(&p) {
@@ -1237,11 +1358,7 @@ fn push_line(line: &[geojson::Position], attrs: &[(String, String)], parts: &mut
 }
 
 /// 空 Polygon（无环）直接丢弃；`poly[0]` 为外环、`poly[1..]` 为孔。
-fn push_polygon(
-    poly: geojson::PolygonType,
-    attrs: &[(String, String)],
-    parts: &mut Vec<Part>,
-) {
+fn push_polygon(poly: geojson::PolygonType, attrs: &[(String, String)], parts: &mut Vec<Part>) {
     let mut rings = poly.into_iter().map(|r| positions_to_coords(&r));
     let Some(outer) = rings.next() else {
         return;
@@ -1316,7 +1433,11 @@ fn dbf_field_names(dbf_path: &Path) -> Result<Vec<String>, String> {
     let reader = shapefile::dbase::ReaderBuilder::new()
         .open(dbf_path)
         .map_err(|e| format!(".dbf 打开失败：{e}"))?;
-    Ok(reader.fields().iter().map(|f| f.name().to_string()).collect())
+    Ok(reader
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect())
 }
 
 /// dbase 记录 → 属性键值对。`field_names` 由调用方按 dbf 模式顺序给出，
@@ -1461,12 +1582,7 @@ fn expand_geometry(geom: &Geometry<f64>, parts: &mut Vec<Part>, attrs: &[(String
             let (a, b, c) = (t.v1(), t.v2(), t.v3());
             push(
                 Geometry2D::Polygon {
-                    outer: vec![
-                        [a.x, a.y],
-                        [b.x, b.y],
-                        [c.x, c.y],
-                        [a.x, a.y],
-                    ],
+                    outer: vec![[a.x, a.y], [b.x, b.y], [c.x, c.y], [a.x, a.y]],
                     holes: Vec::new(),
                 },
                 parts,
@@ -1554,7 +1670,11 @@ mod tests {
           ]
         }"#;
         let layer = geojson_to_layer(json);
-        assert_eq!(layer.outer_rings.len(), 3, "1 个 Polygon + MultiPolygon 的 2 个多边形");
+        assert_eq!(
+            layer.outer_rings.len(),
+            3,
+            "1 个 Polygon + MultiPolygon 的 2 个多边形"
+        );
         assert_eq!(layer.hole_counts, vec![1, 0, 1]);
         assert_eq!(layer.hole_rings.len(), 2);
         assert_eq!(layer.feature_count, 3);
@@ -1696,7 +1816,10 @@ mod tests {
         rec.insert("f".into(), FieldValue::Float(Some(1.5)));
         rec.insert("dd".into(), FieldValue::Double(2.25));
         rec.insert("b".into(), FieldValue::Logical(Some(true)));
-        rec.insert("dt".into(), FieldValue::Date(Some(Date::new(5, 6, 2024).unwrap())));
+        rec.insert(
+            "dt".into(),
+            FieldValue::Date(Some(Date::new(5, 6, 2024).unwrap())),
+        );
         rec.insert("none".into(), FieldValue::Character(None));
         rec.insert(
             "ts".into(),
@@ -1754,7 +1877,12 @@ mod tests {
 
     fn temp_path(tag: &str, ext: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("rustgis_import_{}_{}.{}", std::process::id(), tag, ext));
+        p.push(format!(
+            "rustgis_import_{}_{}.{}",
+            std::process::id(),
+            tag,
+            ext
+        ));
         p
     }
 
@@ -1813,7 +1941,11 @@ mod tests {
 
         let t = std::time::Instant::now();
         let bytes = std::fs::read(&path).expect("读取失败");
-        println!("fs::read         {:>10?}  ({} bytes)", t.elapsed(), bytes.len());
+        println!(
+            "fs::read         {:>10?}  ({} bytes)",
+            t.elapsed(),
+            bytes.len()
+        );
 
         let t = std::time::Instant::now();
         let layer = load_file(&path).expect("导入失败");
@@ -1826,7 +1958,11 @@ mod tests {
         let t = std::time::Instant::now();
         let mut parts = Vec::new();
         collect_geojson_parts(gj, &mut parts);
-        println!("expand geometry  {:>10?}  ({} parts)", t.elapsed(), parts.len());
+        println!(
+            "expand geometry  {:>10?}  ({} parts)",
+            t.elapsed(),
+            parts.len()
+        );
 
         let t = std::time::Instant::now();
         let mut rings = Vec::new();

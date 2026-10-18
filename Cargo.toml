@@ -1,8 +1,8 @@
 [package]
 name = "rustgis"
-version = "0.2.2"
+version = "0.4.0"
 edition = "2024"
-description = "RustGIS — 纯 Rust 复刻 ArcGIS 的桌面 GIS 平台：低内存占用、高性能、跨平台"
+description = "RustGIS — 基于Rust开发的高性能地理信息系统（GIS）应用程序：低内存占用、高性能、跨平台"
 license = "MIT OR Apache-2.0"
 repository = "https://example.com/rustgis"
 
@@ -24,6 +24,17 @@ serde_json = "1"
 # geo 自带 Buffer（i_overlay 的 stroke/outline：圆角连接 + 圆/方/平端帽）、
 # BooleanOps（融合/挖孔）与基于 earcut 的三角剖分；纯 Rust、无 C 依赖。
 geo = "0.33"
+# 栅格支持（v0.3）：纯 Rust 的 TIFF / GeoTIFF 解码器，支持 strip / tile 分块按需解码，
+# 内置 LZW / Deflate / PackBits / Fax / JPEG 解压，无需任何 C 依赖。
+# 它已是 image（egui 的贴图依赖）的传递依赖，显式声明后可直接使用其分块读取 API。
+tiff = "0.11"
+# Sentinel-2 SAFE（v0.4）：SAFE 包里的波段是 JPEG2000（.jp2）编码，
+# 纯 Rust 解码器 j2k 支持按区域（ROI）与缩放倍率解码，正好匹配
+# 「只解码视窗内像素 + 按缩放级别降采样」的显示管线，无 C 依赖。
+j2k = "0.12"
+# SAFE 包的元数据是 XML（MTD_MSIL*.xml）：用纯 Rust 的流式解析器读取
+# 波段清单、地理编码与产品级别，不引入 C 依赖。
+quick-xml = "0.37"
 
 [dev-dependencies]
 # 仅测试用：生成真实 Shapefile 以做端到端导入链路验证（版本与 shapefile 依赖一致）。

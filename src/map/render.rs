@@ -240,8 +240,10 @@ impl Renderer {
         for line in &layer.lines {
             simplify::stroke_path_into(line, proj, false, pad, &mut self.stroke_pts);
             if self.stroke_pts.len() >= 2 {
-                self.shapes
-                    .push(Shape::Path(PathShape::line(self.stroke_pts.clone(), stroke)));
+                self.shapes.push(Shape::Path(PathShape::line(
+                    self.stroke_pts.clone(),
+                    stroke,
+                )));
             }
         }
     }
@@ -517,7 +519,13 @@ mod tests {
                 vertices += mesh.vertices.len();
             }
         }
-        (build_ms.get(), tess_ms, vertices, primitives.len(), stats.get())
+        (
+            build_ms.get(),
+            tess_ms,
+            vertices,
+            primitives.len(),
+            stats.get(),
+        )
     }
 
     #[test]
@@ -563,7 +571,9 @@ mod tests {
         moved.center[0] += 1.0 / view.scale as f64;
         let (pan, _, _, _, pan_stats) = probe_frame(&mut renderer, &manager, &moved, rect);
 
-        println!("规模：{rings} 环 × {verts} 顶点 + {points} 点 ⇒ 源顶点 {src_verts} / 三角 {tris}");
+        println!(
+            "规模：{rings} 环 × {verts} 顶点 + {points} 点 ⇒ 源顶点 {src_verts} / 三角 {tris}"
+        );
         println!(
             "单帧：构建 {build:.2} ms + 三角化 {tess:.2} ms = {:.2} ms ⇒ 输出顶点 {vertices} / 图元 {prims} / 形状 {}",
             build + tess,
@@ -672,9 +682,8 @@ mod tests {
             outer: square(900.0, 900.0, 1000.0, 1000.0),
             holes: Vec::new(),
         };
-        let layer = Layer::from_geometry("tris".to_string(), Vec::new(), Vec::new(), vec![
-            near, far,
-        ]);
+        let layer =
+            Layer::from_geometry("tris".to_string(), Vec::new(), Vec::new(), vec![near, far]);
         assert_eq!(layer.triangles.len(), 4, "两个矩形各应剖分成 2 个三角形");
         let mut manager = LayerManager::default();
         manager.add(layer);

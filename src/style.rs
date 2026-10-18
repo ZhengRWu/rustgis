@@ -28,10 +28,11 @@ pub const BORDER_STRONG: Color32 = Color32::from_rgb(199, 207, 216);
 
 // ─────────────────────────── 设计 token：文字 ───────────────────────────
 
-/// 主文字色（近黑、微冷，避免纯黑刺眼）。
-pub const TEXT: Color32 = Color32::from_rgb(28, 36, 49);
+/// 主文字色：纯黑（产品约定——文字颜色非必要，全部默认使用纯黑）。
+pub const TEXT: Color32 = Color32::BLACK;
 
-/// 次级文字色（弱标签 / 提示 / 空状态水印）。
+/// 次级颜色（禁用的图标笔划 / 勾选标记等图形元素）。
+/// 文字不使用此色：弱文字统一走纯黑（见 `visuals` 的 `override_text_color`）。
 pub const TEXT_WEAK: Color32 = Color32::from_rgb(106, 117, 133);
 
 // ─────────────────────────── 设计 token：强调色 ───────────────────────────
@@ -109,6 +110,11 @@ pub fn visuals() -> egui::Visuals {
     // ── 强调色（ArcGIS 蓝）：超链接 / 文本光标 ──
     v.hyperlink_color = ACCENT;
     v.text_cursor.stroke = Stroke::new(1.5_f32, ACCENT);
+
+    // ── 文字统一纯黑（产品约定）：覆盖全局默认文字色，标签 / 菜单 / 输入框 /
+    //    控件文字全部为纯黑；egui 的 `.weak()` 与禁用文字在纯黑基础上灰化，
+    //    层级只靠深浅区分，不引入其他文字颜色 ──
+    v.override_text_color = Some(TEXT);
 
     // ── 选中高亮（列表 / 可选项 / 文本选中） ──
     v.selection.bg_fill = SELECTION;

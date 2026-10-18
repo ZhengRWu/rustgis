@@ -265,7 +265,7 @@ impl RustGisApp {
                     name: layer.name.clone(),
                     fields: layer.fields.clone(),
                 }),
-                LayerNode::Group(_) => None,
+                LayerNode::Group(_) | LayerNode::Raster(_) => None,
             })
             .collect()
     }
@@ -557,7 +557,8 @@ fn form_inputs(
             d.topic = HelpTopic::Inputs;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if widgets::icon_button(ui, &texts.browse_layer, true, widgets::draw_group_icon).clicked()
+            if widgets::icon_button(ui, &texts.browse_layer, true, widgets::draw_group_icon)
+                .clicked()
             {
                 *outgoing = Some(GeoMsg::AddLayer);
             }
@@ -630,8 +631,13 @@ fn form_output(ui: &mut egui::Ui, d: &mut GeoDialog, texts: &Texts, ctx: &Contex
             d.output_edited = true;
         }
         let can_browse = d.browse.is_none();
-        if widgets::icon_button(ui, &texts.browse_output, can_browse, widgets::draw_group_icon)
-            .clicked()
+        if widgets::icon_button(
+            ui,
+            &texts.browse_output,
+            can_browse,
+            widgets::draw_group_icon,
+        )
+        .clicked()
         {
             let name = PathBuf::from(&d.output_path)
                 .file_name()
@@ -837,12 +843,7 @@ fn label_of<T: PartialEq + Copy>(labels: &[(T, String)], value: T) -> &str {
 }
 
 /// 下拉框：与「缓冲区」对话框同一套宽度与样式。
-fn combo<T: PartialEq + Copy>(
-    ui: &mut egui::Ui,
-    id: &str,
-    labels: &[(T, String)],
-    value: &mut T,
-) {
+fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, labels: &[(T, String)], value: &mut T) {
     let selected = label_of(labels, *value).to_string();
     egui::ComboBox::from_id_salt(id)
         .selected_text(selected)
@@ -887,7 +888,8 @@ mod tests {
             outer: ring,
             holes: Vec::new(),
         };
-        let mut layer = Layer::from_geometry(name.to_string(), Vec::new(), Vec::new(), vec![polygon]);
+        let mut layer =
+            Layer::from_geometry(name.to_string(), Vec::new(), Vec::new(), vec![polygon]);
         layer.fields = vec!["Id".to_string()];
         layer.attrs = vec![vec!["1".to_string()]];
         layer.ring_rows = vec![0];
@@ -913,8 +915,8 @@ mod tests {
 
     #[test]
     fn geoprocessing_menu_items_reach_the_dialog() {
-        use crate::menus::{Entry, MENUS};
         use crate::app::MenuAction;
+        use crate::menus::{Entry, MENUS};
 
         // 「地理处理」菜单里列出的 key 必须都能被 on_menu_item 认领：
         // menus.rs 与 app/mod.rs 是两处字符串，靠这个测试保证不会走偏。
@@ -929,7 +931,11 @@ mod tests {
         assert!(MENUS.iter().any(|menu| menu.label == "menu.geoprocessing"));
         assert!(items.contains(&"overlay.buffer"), "{items:?}");
         for op in OverlayOp::ALL {
-            assert!(items.contains(&op.menu_key()), "菜单缺 {}: {items:?}", op.menu_key());
+            assert!(
+                items.contains(&op.menu_key()),
+                "菜单缺 {}: {items:?}",
+                op.menu_key()
+            );
         }
 
         // 逐个点击：缓冲区复用缓冲区窗口，其余 5 个切换地理处理窗口的工具。
@@ -938,7 +944,10 @@ mod tests {
         app.layers.add(square_layer("a", 0.0, 0.0));
         app.layers.add(square_layer("b", 50.0, 50.0));
 
-        assert!(matches!(app.on_menu_item("overlay.buffer"), MenuAction::None));
+        assert!(matches!(
+            app.on_menu_item("overlay.buffer"),
+            MenuAction::None
+        ));
         assert!(app.buffer_dialog.is_some(), "缓冲区菜单项应打开缓冲区窗口");
         assert!(app.geo_dialog.is_none());
 
@@ -947,7 +956,10 @@ mod tests {
             let window = app.geo_dialog.as_ref().expect("地理处理窗口");
             let d = window.state.lock().expect("lock");
             assert_eq!(d.op, op, "{} 应切换到对应的工具", op.menu_key());
-            assert!(app.buffer_dialog.is_some(), "两个窗口各自独立，不应互相关闭");
+            assert!(
+                app.buffer_dialog.is_some(),
+                "两个窗口各自独立，不应互相关闭"
+            );
         }
     }
 
@@ -1073,7 +1085,7 @@ mod tests {
             .iter()
             .filter_map(|row| match row.node {
                 LayerNode::Layer(layer) => Some(layer.name.clone()),
-                LayerNode::Group(_) => None,
+                LayerNode::Group(_) | LayerNode::Raster(_) => None,
             })
             .collect();
         // 主输入是图层树最上面的 b（最新添加），因此结果图层名为 b_Clip。

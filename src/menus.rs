@@ -1,12 +1,17 @@
 //! 菜单栏定义与渲染。
 //!
-//! 菜单结构对标 ArcGIS（见产品文档 §7）。「文件」（新建 / 打开 / 保存 / 另存为 /
-//! 退出）、「视图」（放大 / 缩小 / 平移 / 缩放至全图）、「图层 / 数据」（添加图层）、
-//! 「帮助」（语言 / 关于）为真实功能；其余菜单项点击后弹出“正在开发中”对话框。
+//! 顶层菜单栏对标 ArcGIS Desktop（见产品文档 §7）：文件 / 编辑 / 视图 / 书签 /
+//! 插入 / 选择 / 地理处理 / 自定义 / 窗口 / 帮助，共 10 个菜单，每项标签末尾
+//! 带快捷键助记字母（如「文件(F)」），与 ArcGIS 的 `文件(F)` 风格一致。
+//!
+//! 真实功能：「文件」（新建 / 打开 / 保存 / 另存为 / 退出）、「视图」（放大 /
+//! 缩小 / 平移 / 缩放至全图）、「插入」（添加图层）、「选择」（全选）、「地理处理」
+//! （缓冲区 + 叠加 5 工具）、「帮助」（语言 / 关于）；其余菜单项点击后弹出
+//! "正在开发中"对话框（走 [`RustGisApp::on_menu_item`] 的兜底分支）。
 //!
 //! 菜单标签以 i18n key 存储，渲染时按当前语言解析（[`crate::i18n::Language::t`]）。
 
-use egui::{menu, Ui};
+use egui::{Ui, menu};
 
 use crate::app::{MenuAction, RustGisApp};
 use crate::i18n::Language;
@@ -31,6 +36,7 @@ pub struct MenuDef {
 
 /// 完整菜单栏（顺序即显示顺序）。
 pub static MENUS: &[MenuDef] = &[
+    // ── 文件(F) ──
     MenuDef {
         label: "menu.file",
         entries: &[
@@ -45,6 +51,7 @@ pub static MENUS: &[MenuDef] = &[
             Entry::Item("file.exit"),
         ],
     },
+    // ── 编辑(E) ──
     MenuDef {
         label: "menu.edit",
         entries: &[
@@ -59,6 +66,7 @@ pub static MENUS: &[MenuDef] = &[
             Entry::Item("edit.properties"),
         ],
     },
+    // ── 视图(V) ──
     MenuDef {
         label: "menu.view",
         entries: &[
@@ -71,33 +79,41 @@ pub static MENUS: &[MenuDef] = &[
             Entry::Item("view.layout"),
             Entry::Separator,
             Entry::Item("view.basemap"),
-            Entry::Item("view.bookmarks"),
         ],
     },
+    // ── 书签(B) ──
     MenuDef {
-        label: "menu.layer",
+        label: "menu.bookmarks",
+        entries: &[Entry::Item("bookmark.add"), Entry::Item("bookmark.manager")],
+    },
+    // ── 插入(I) ──
+    MenuDef {
+        label: "menu.insert",
         entries: &[
             Entry::Item("layer.add"),
             Entry::Item("layer.addRaster"),
+            Entry::Item("layer.addSafe"),
             Entry::Separator,
-            Entry::Item("layer.order"),
-            Entry::Item("layer.properties"),
-            Entry::Item("layer.display"),
+            Entry::Item("insert.text"),
+            Entry::Item("insert.picture"),
+            Entry::Item("insert.grid"),
+            Entry::Item("insert.scalebar"),
+            Entry::Item("insert.legend"),
         ],
     },
+    // ── 选择(S) ──
     MenuDef {
-        label: "menu.data",
+        label: "menu.select",
         entries: &[
-            Entry::Item("data.connect"),
-            Entry::Item("data.online"),
+            Entry::Item("select.byLocation"),
+            Entry::Item("select.byAttribute"),
+            Entry::Item("select.bySquare"),
             Entry::Separator,
-            Entry::Item("data.import"),
-            Entry::Item("data.export"),
-            Entry::Separator,
-            Entry::Item("data.table"),
-            Entry::Item("data.manage"),
+            Entry::Item("select.invert"),
+            Entry::Item("select.deselect"),
         ],
     },
+    // ── 地理处理(G) ──
     MenuDef {
         label: "menu.geoprocessing",
         entries: &[
@@ -120,27 +136,32 @@ pub static MENUS: &[MenuDef] = &[
             Entry::Item("analysis.3d"),
         ],
     },
+    // ── 自定义(C) ──
     MenuDef {
-        label: "menu.map",
+        label: "menu.customize",
         entries: &[
-            Entry::Item("map.symbology"),
-            Entry::Item("map.labels"),
-            Entry::Item("map.legend"),
-            Entry::Item("map.scale"),
-            Entry::Separator,
-            Entry::Item("map.properties"),
-        ],
-    },
-    MenuDef {
-        label: "menu.tools",
-        entries: &[
-            Entry::Item("tools.geoprocessing"),
+            Entry::Item("customize.toolbars"),
             Entry::Item("tools.modelBuilder"),
-            Entry::Item("tools.toolbox"),
             Entry::Separator,
             Entry::Item("tools.options"),
         ],
     },
+    // ── 窗口(W) ──
+    MenuDef {
+        label: "menu.window",
+        entries: &[
+            Entry::Item("window.contents"),
+            Entry::Item("window.find"),
+            Entry::Separator,
+            // 底图：与「视图 → 底图管理」同一功能，两个入口。
+            Entry::Item("view.basemap"),
+            Entry::Item("window.catalog"),
+            Entry::Separator,
+            Entry::Item("window.arrange"),
+            Entry::Item("window.close"),
+        ],
+    },
+    // ── 帮助(H) ──
     MenuDef {
         label: "menu.help",
         entries: &[
@@ -179,10 +200,7 @@ pub fn show_menu_bar(ui: &mut Ui, app: &mut RustGisApp) {
                             ui.menu_button(lang_label, |ui| {
                                 for lang in Language::ALL {
                                     let mut checked = app.language == lang;
-                                    if ui
-                                        .checkbox(&mut checked, lang.native_name())
-                                        .changed()
-                                    {
+                                    if ui.checkbox(&mut checked, lang.native_name()).changed() {
                                         app.set_language(lang);
                                     }
                                 }

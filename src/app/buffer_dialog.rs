@@ -333,11 +333,7 @@ impl RustGisApp {
     /// 确定：快照参数 → 后台线程执行（表单校验已在窗口里完成）。
     fn start_buffer_job(&mut self, input_id: u64, params: BufferParams, path: PathBuf) {
         // 输入图层（克隆一份给后台线程：缓冲区结果图层必须独立存在）。
-        let layer = self
-            .layers
-            .node(input_id)
-            .and_then(|n| n.layer())
-            .cloned();
+        let layer = self.layers.node(input_id).and_then(|n| n.layer()).cloned();
         let Some(layer) = layer else {
             // 图层在点确定前被删掉了：保留窗口内容，只报错。
             self.buffer_error("buffer.error.noInput");

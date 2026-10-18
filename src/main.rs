@@ -1,5 +1,7 @@
-//! RustGIS — 纯 Rust 复刻 ArcGIS 的桌面 GIS 平台。
+//! RustGIS — 基于Rust开发的高性能地理信息系统（GIS）应用程序。
 //!
+//! v0.3：栅格图层（GeoTIFF 读取 / 地理参考 / 分块窗口读取 / 金字塔与重采样 /
+//!      符号系统与统计 / 图层属性）——见 `raster` 模块。
 //! v0.2.1：投影 / 坐标系识别与展示（GeoJSON 默认 EPSG:4326 / Shapefile
 //!      `.prj` WKT 识别；首个导入图层定工程默认；状态栏动态显示）
 //!      + v0.2 全部（导入 / 渲染 / 图层面板 / 工程文件）。
@@ -15,6 +17,7 @@ mod i18n;
 mod map;
 mod menus;
 mod project;
+mod raster;
 mod style;
 
 fn main() -> eframe::Result<()> {

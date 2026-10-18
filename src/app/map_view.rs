@@ -30,9 +30,16 @@ impl RustGisApp {
         // 记录本帧地图区域：缓冲结果落点判断（视图是否已包含结果）需要它。
         self.map_rect = Some(rect);
 
-        if self.needs_fit || self.map.view.is_none() {
+        let just_fit = self.needs_fit || self.map.view.is_none();
+        if just_fit {
             self.map.view = Some(map::MapView::fit(self.layers.total_bounds(), rect));
             self.needs_fit = false;
+        }
+        // 右键「缩放至图层 / 缩放至组」：范围由菜单回调算出，这里用本帧地图控件的
+        // 实际像素矩形适配。放在全图适配之后——同一帧两者都排队时以用户明确点的为准。
+        if let Some(bounds) = self.zoom_extent.take() {
+            self.map.view = Some(map::MapView::fit(Some(bounds), rect));
+            self.dirty = true;
         }
         let mut view = self.map.view.unwrap();
 
@@ -84,8 +91,8 @@ impl RustGisApp {
         painter.rect_filled(rect, 0.0, style::WHITE);
 
         if self.layers.is_empty() {
-            // 空数据占位说明：白底画布上用次级文字色，呈"水印"观感
-            let ink = style::TEXT_WEAK;
+            // 空数据占位说明：与全应用一致，文字默认纯黑。
+            let ink = style::TEXT;
             ui.vertical_centered_justified(|ui| {
                 ui.add_space(rect.height() * 0.32);
                 ui.colored_label(ink, RichText::new(self.t("mapview.title")).strong());
@@ -95,9 +102,43 @@ impl RustGisApp {
                 ui.colored_label(ink, RichText::new(self.t("mapview.desc2")));
             });
         } else {
+            // 栅格图层先绘制（影像在矢量之下，与 ArcGIS 默认叠放顺序一致）：
+            // 按当前视图换算窗口 → 取合适分辨率 → 拉伸/NoData 处理后上传纹理。
+            let rasters: Vec<&crate::raster::RasterLayer> =
+                self.layers.iter_visible_rasters().collect();
+            if !rasters.is_empty() {
+                self.raster_painter
+                    .paint(ui.ctx(), &painter, rect, &view, &rasters);
+            }
             // 缓存渲染：视图 / 画布 / 图层都没变时直接复用上一帧的形状。
             self.map_renderer
                 .render(&painter, rect, &self.layers, &view);
+        }
+
+        // 拖放提示：文件悬停在窗口上（尚未松开）时铺一层淡色 + 虚线框，
+        // 让用户确认「松手就会加入图层」。与右下角通知同色（ACCENT）。
+        if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
+            let frame = rect.shrink(6.0);
+            painter.rect_filled(frame, 0.0, style::ACCENT.gamma_multiply(0.06));
+            painter.extend(egui::Shape::dashed_line(
+                &[
+                    frame.left_top(),
+                    frame.right_top(),
+                    frame.right_bottom(),
+                    frame.left_bottom(),
+                    frame.left_top(),
+                ],
+                egui::Stroke::new(2.0_f32, style::ACCENT),
+                10.0,
+                6.0,
+            ));
+            painter.text(
+                frame.center(),
+                egui::Align2::CENTER_CENTER,
+                self.t("mapview.dropHint"),
+                egui::FontId::proportional(15.0),
+                style::ACCENT,
+            );
         }
     }
 }

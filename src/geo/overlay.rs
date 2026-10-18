@@ -671,17 +671,16 @@ fn intersect_polygons(layers: &[&Layer]) -> Result<Layer, String> {
     }
 
     for layer in &layers[1..] {
-        let others: Vec<Piece> =
-            collect_features(layer)
-                .iter()
-                .filter_map(|feature| {
-                    let shape = feature_shapes(feature, &frame);
-                    (!shape.0.is_empty()).then(|| {
-                        let box_ = bounds_of(&shape);
-                        (shape, box_, feature.attrs(layer))
-                    })
+        let others: Vec<Piece> = collect_features(layer)
+            .iter()
+            .filter_map(|feature| {
+                let shape = feature_shapes(feature, &frame);
+                (!shape.0.is_empty()).then(|| {
+                    let box_ = bounds_of(&shape);
+                    (shape, box_, feature.attrs(layer))
                 })
-                .collect();
+            })
+            .collect();
 
         let mut next = Vec::new();
         for (geom, geom_box, attrs) in &acc {
@@ -690,11 +689,8 @@ fn intersect_polygons(layers: &[&Layer]) -> Result<Layer, String> {
                 if !geom_box.intersects(other_box) {
                     continue;
                 }
-                let piece = geom.boolean_op_with_fill_rule(
-                    other,
-                    OpType::Intersection,
-                    FillRule::Positive,
-                );
+                let piece =
+                    geom.boolean_op_with_fill_rule(other, OpType::Intersection, FillRule::Positive);
                 if piece.0.is_empty() {
                     continue;
                 }
@@ -733,7 +729,9 @@ fn intersect_points(layers: &[&Layer]) -> Result<Layer, String> {
         for feature in collect_features(layer) {
             let attrs = feature.attrs(layer);
             for point in &feature.points {
-                index.entry(point_key(*point)).or_insert_with(|| attrs.clone());
+                index
+                    .entry(point_key(*point))
+                    .or_insert_with(|| attrs.clone());
             }
         }
         acc = acc
@@ -1020,10 +1018,9 @@ fn clip_line(
                 continue;
             }
             let start = lerp(a, b, t0);
-            if current
-                .last()
-                .is_none_or(|last| (last.x - start.x).abs() > T_EPS || (last.y - start.y).abs() > T_EPS)
-            {
+            if current.last().is_none_or(|last| {
+                (last.x - start.x).abs() > T_EPS || (last.y - start.y).abs() > T_EPS
+            }) {
                 flush(&mut current, &mut result, frame);
                 current.push(start);
             }
@@ -1066,7 +1063,12 @@ fn segment_param(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>, d: Coord<f64>) -> 
 }
 
 /// 两条线段的交点（含端点相交；平行或共线返回 `None`）。
-fn segment_crossing(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>, d: Coord<f64>) -> Option<Coord<f64>> {
+fn segment_crossing(
+    a: Coord<f64>,
+    b: Coord<f64>,
+    c: Coord<f64>,
+    d: Coord<f64>,
+) -> Option<Coord<f64>> {
     segment_param(a, b, c, d).map(|t| lerp(a, b, t))
 }
 
@@ -1157,7 +1159,11 @@ mod tests {
     }
 
     fn temp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("rustgis_overlay_{}_{}.geojson", tag, std::process::id()))
+        std::env::temp_dir().join(format!(
+            "rustgis_overlay_{}_{}.geojson",
+            tag,
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -1195,7 +1201,8 @@ mod tests {
     #[test]
     fn clip_requires_a_polygon_mask() {
         let input = polygons("a", &[(0.0, 0.0, 10.0, "1", "A")]);
-        let mut points = Layer::from_geometry("p".to_string(), vec![[1.0, 1.0]], Vec::new(), Vec::new());
+        let mut points =
+            Layer::from_geometry("p".to_string(), vec![[1.0, 1.0]], Vec::new(), Vec::new());
         points.fields = vec!["Id".to_string()];
         points.attrs = vec![vec!["5".to_string()]];
         points.point_rows = vec![0];
@@ -1229,7 +1236,10 @@ mod tests {
         let clipped_line = clip(&lines, &mask).expect("clip line");
         assert_eq!(clipped_line.lines.len(), 1);
         let seg = &clipped_line.lines[0];
-        assert!((seg[0][0]).abs() < 1e-6 && (seg[1][0] - 100.0).abs() < 1e-6, "{seg:?}");
+        assert!(
+            (seg[0][0]).abs() < 1e-6 && (seg[1][0] - 100.0).abs() < 1e-6,
+            "{seg:?}"
+        );
         assert_eq!(clipped_line.attrs[0][0], "7");
 
         // 点：面内的保留，面外的丢弃。
@@ -1253,7 +1263,8 @@ mod tests {
     #[test]
     fn intersect_rejects_mixed_geometry_classes() {
         let a = polygons("a", &[(0.0, 0.0, 10.0, "1", "A")]);
-        let mut points = Layer::from_geometry("p".to_string(), vec![[1.0, 1.0]], Vec::new(), Vec::new());
+        let mut points =
+            Layer::from_geometry("p".to_string(), vec![[1.0, 1.0]], Vec::new(), Vec::new());
         points.fields = vec!["Id".to_string()];
         points.attrs = vec![vec!["5".to_string()]];
         points.point_rows = vec![0];
@@ -1328,8 +1339,7 @@ mod tests {
         assert_eq!(out.attrs[1][0], "2");
         let b_area = {
             let ring = &out.outer_rings[1];
-            let coords: Vec<Coord<f64>> =
-                ring.iter().map(|p| Coord { x: p[0], y: p[1] }).collect();
+            let coords: Vec<Coord<f64>> = ring.iter().map(|p| Coord { x: p[0], y: p[1] }).collect();
             Polygon::new(LineString::new(coords), Vec::new()).unsigned_area()
         };
         assert!((b_area - 5_000.0).abs() <= 1e-6 * 5_000.0, "{b_area}");
@@ -1353,7 +1363,10 @@ mod tests {
     #[test]
     fn merge_concatenates_layers_and_unions_fields() {
         let a = polygons("a", &[(0.0, 0.0, 10.0, "1", "A")]);
-        let b = polygons("b", &[(20.0, 0.0, 10.0, "2", "B"), (40.0, 0.0, 10.0, "3", "B")]);
+        let b = polygons(
+            "b",
+            &[(20.0, 0.0, 10.0, "2", "B"), (40.0, 0.0, 10.0, "3", "B")],
+        );
         let out = merge(&[&a, &b]).expect("merge");
         assert_eq!(out.feature_count, 3);
         assert_eq!(out.fields, vec!["Id", "Zone"]);
@@ -1436,7 +1449,10 @@ mod tests {
     #[test]
     fn default_output_names_follow_arcgis_suffixes() {
         assert_eq!(OverlayOp::Clip.default_output_name("roads"), "roads_Clip");
-        assert_eq!(OverlayOp::Dissolve.default_output_name("roads"), "roads_Dissolve");
+        assert_eq!(
+            OverlayOp::Dissolve.default_output_name("roads"),
+            "roads_Dissolve"
+        );
     }
 
     #[test]

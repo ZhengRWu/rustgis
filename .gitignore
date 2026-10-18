@@ -5,6 +5,7 @@
 
 # 本地代理记忆，不入库
 .workbuddy/
+.dsh/
 
 # 大型样例数据（14 MB 道路 GeoJSON，仅作本地测试用）
 Road_C_Project_Buffer.geojson

@@ -19,6 +19,7 @@ use crate::geo::{
     CrsId, Group, Layer, LayerNode, LayerStyle, PolygonData, ProjectionInfo, ProjectionModel,
 };
 use crate::map::MapView;
+use crate::raster::{RasterDisplay, RasterLayer};
 
 /// 工程文件格式版本（破坏性变更时递增；高于当前值则拒绝加载）。
 ///
@@ -27,7 +28,8 @@ use crate::map::MapView;
 /// - v3：工程级 / 图层级投影与坐标系（`projection` 字段，旧版本读取时缺省
 ///   为"未识别"，见 [`ProjectionInfo::none`]）。
 /// - v4：图层属性表（`fields` / `attrs` / `*_rows`，旧版本读取时缺省为空表）。
-pub const PROJECT_VERSION: u32 = 4;
+/// - v5：栅格图层节点（`kind: "raster"`，只存源文件路径与符号系统，像素不落盘）。
+pub const PROJECT_VERSION: u32 = 5;
 /// 工程文件扩展名（文件选择器 / 落盘补全共用）。
 pub const PROJECT_EXT: &str = "rustgis";
 /// 新建工程的默认文件名（"另存为"对话框预填）。
@@ -42,6 +44,8 @@ pub struct ProjectData {
     pub view: Option<MapView>,
     /// 保存时的工程默认投影 / 坐标系；旧版本工程文件缺省为 `None`（未设置）。
     pub projection: Option<ProjectionInfo>,
+    /// 加载过程中的非致命问题（例如栅格源文件已不在原路径，图层被跳过）。
+    pub warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,23 +72,33 @@ struct ProjectFile {
 
 impl ProjectFile {
     /// 读出图层树：v2 直接取 `nodes`；v1 把扁平列表按"顶层图层"包装。
-    fn to_nodes(&self) -> Result<Vec<LayerNode>, String> {
+    ///
+    /// 返回 `(节点, 非致命警告)`：栅格图层依赖外部源文件，文件缺失时跳过该节点
+    /// 而不是让整个工程打不开。
+    fn to_nodes(&self) -> Result<(Vec<LayerNode>, Vec<String>), String> {
         if !self.nodes.is_empty() {
-            return Ok(self.nodes.iter().map(NodeDto::to_node).collect());
+            let mut nodes = Vec::with_capacity(self.nodes.len());
+            let mut warnings = Vec::new();
+            for dto in &self.nodes {
+                dto.collect_nodes(&mut nodes, &mut warnings);
+            }
+            return Ok((nodes, warnings));
         }
         if self.layers.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         if self.version > 1 {
             return Err("工程文件缺少图层树数据".to_string());
         }
         // v1 的 `layers` 是自底向上的渲染顺序，转成面板顺序要反过来。
-        Ok(self
-            .layers
-            .iter()
-            .rev()
-            .map(|l| LayerNode::Layer(l.to_layer()))
-            .collect())
+        Ok((
+            self.layers
+                .iter()
+                .rev()
+                .map(|l| LayerNode::Layer(l.to_layer()))
+                .collect(),
+            Vec::new(),
+        ))
     }
 }
 
@@ -98,6 +112,7 @@ impl ProjectFile {
 enum NodeDto {
     Layer(LayerDto),
     Group(GroupDto),
+    Raster(RasterDto),
 }
 
 /// 图层组的文件表示。
@@ -122,22 +137,58 @@ impl From<&LayerNode> for NodeDto {
                 expanded: g.expanded,
                 children: g.children.iter().map(NodeDto::from).collect(),
             }),
+            LayerNode::Raster(r) => Self::Raster(RasterDto {
+                path: r.path.to_string_lossy().into_owned(),
+                name: r.name.clone(),
+                visible: r.visible,
+                display: r.display.clone(),
+            }),
         }
     }
 }
 
+/// 栅格图层的文件表示：只记录源文件路径与符号系统，像素不落盘。
+#[derive(Serialize, Deserialize)]
+struct RasterDto {
+    /// 源文件路径（原本可能是相对路径，加载时按工程文件所在目录解析）。
+    path: String,
+    name: String,
+    #[serde(default = "default_true")]
+    visible: bool,
+    #[serde(default)]
+    display: RasterDisplay,
+}
+
 impl NodeDto {
-    /// 还原为可渲染节点（id 置 0，由 `LayerManager::replace_with` 重编号）。
-    fn to_node(&self) -> LayerNode {
+    /// 还原为节点并追加到 `out`（组会递归展开）。
+    ///
+    /// 栅格源文件缺失 / 损坏时记录一条警告并跳过该节点。
+    fn collect_nodes(&self, out: &mut Vec<LayerNode>, warnings: &mut Vec<String>) {
         match self {
-            Self::Layer(l) => LayerNode::Layer(l.to_layer()),
-            Self::Group(g) => LayerNode::Group(Group {
+            Self::Layer(l) => out.push(LayerNode::Layer(l.to_layer())),
+            Self::Group(g) => out.push(LayerNode::Group(Group {
                 id: 0,
                 name: g.name.clone(),
                 visible: g.visible,
                 expanded: g.expanded,
-                children: g.children.iter().map(NodeDto::to_node).collect(),
-            }),
+                children: {
+                    let mut children = Vec::new();
+                    for child in &g.children {
+                        child.collect_nodes(&mut children, warnings);
+                    }
+                    children
+                },
+            })),
+            Self::Raster(r) => match RasterLayer::open(&r.path, r.name.clone()) {
+                Ok(layer) => {
+                    let mut layer = layer.with_display(r.display.clone());
+                    layer.visible = r.visible;
+                    out.push(LayerNode::Raster(layer));
+                }
+                Err(err) => {
+                    warnings.push(format!("跳过栅格图层「{}」：{}（{}）", r.name, err, r.path))
+                }
+            },
         }
     }
 }
@@ -423,11 +474,12 @@ pub fn load(path: &Path) -> Result<ProjectData, String> {
             file.version
         ));
     }
-    let nodes = file.to_nodes()?;
+    let (nodes, warnings) = file.to_nodes()?;
     Ok(ProjectData {
         nodes,
         view: file.view.clone().map(MapView::from),
         projection: file.projection.as_ref().map(ProjectionInfo::from),
+        warnings,
     })
 }
 
@@ -443,13 +495,7 @@ mod tests {
             vec![[116.0, 39.0], [116.1, 39.1]],
             vec![vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]],
             vec![PolygonData {
-                outer: vec![
-                    [0.0, 0.0],
-                    [4.0, 0.0],
-                    [4.0, 4.0],
-                    [0.0, 4.0],
-                    [0.0, 0.0],
-                ],
+                outer: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
                 holes: vec![vec![
                     [1.0, 1.0],
                     [2.0, 1.0],
@@ -475,7 +521,8 @@ mod tests {
         p.push(format!(
             "rustgis_project_{}_{}.{}",
             std::process::id(),
-            tag, PROJECT_EXT
+            tag,
+            PROJECT_EXT
         ));
         p
     }
@@ -518,9 +565,7 @@ mod tests {
         let area: f64 = l
             .triangles
             .iter()
-            .map(|t| {
-                ((t[2] - t[0]) * (t[5] - t[1]) - (t[4] - t[0]) * (t[3] - t[1])).abs() * 0.5
-            })
+            .map(|t| ((t[2] - t[0]) * (t[5] - t[1]) - (t[4] - t[0]) * (t[3] - t[1])).abs() * 0.5)
             .sum();
         assert!(
             (area - 15.0).abs() < 1e-6,
@@ -541,15 +586,13 @@ mod tests {
                 name: "底图".to_string(),
                 visible: false,
                 expanded: false,
-                children: vec![
-                    LayerNode::Group(Group {
-                        id: 0,
-                        name: "栅格".to_string(),
-                        visible: true,
-                        expanded: true,
-                        children: vec![inner.clone()],
-                    }),
-                ],
+                children: vec![LayerNode::Group(Group {
+                    id: 0,
+                    name: "栅格".to_string(),
+                    visible: true,
+                    expanded: true,
+                    children: vec![inner.clone()],
+                })],
             }),
             LayerNode::Layer(sample_layer()),
         ];
@@ -601,7 +644,10 @@ mod tests {
         // v1 的 layers 自底向上 ⇒ 面板顺序取反
         assert_eq!(names, vec!["top", "bottom"]);
         assert!(data.nodes[0].layer().is_some());
-        assert!(data.projection.is_none(), "v1 文件没有 projection 字段 ⇒ 未设置");
+        assert!(
+            data.projection.is_none(),
+            "v1 文件没有 projection 字段 ⇒ 未设置"
+        );
         assert_eq!(
             data.nodes[0].layer().unwrap().projection,
             ProjectionInfo::none(),
@@ -804,12 +850,12 @@ mod tests {
 
     /// 新写出的工程文件必须声明 v4。
     #[test]
-    fn saved_file_declares_version_4() {
+    fn saved_file_declares_current_version() {
         let path = temp_project_path("version");
         save(&path, &[], None, None).expect("保存应成功");
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(raw["version"], serde_json::json!(4));
+        assert_eq!(raw["version"], serde_json::json!(PROJECT_VERSION));
     }
 }

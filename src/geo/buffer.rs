@@ -32,7 +32,7 @@ use geo::algorithm::area::Area;
 use geo::algorithm::bool_ops::{BooleanOps, FillRule, OpType};
 use geo::algorithm::buffer::{BufferStyle, LineCap, LineJoin};
 use geo::algorithm::orient::{Direction, Orient};
-use geo::{unary_union, Buffer as GeoBuffer, Coord, LineString, MultiPolygon, Point, Polygon};
+use geo::{Buffer as GeoBuffer, Coord, LineString, MultiPolygon, Point, Polygon, unary_union};
 
 use crate::geo::{Aabb, Coord2D, Layer, PolygonData, ProjectionModel};
 
@@ -196,11 +196,7 @@ pub enum DissolveType {
 }
 
 impl DissolveType {
-    pub const ALL: [DissolveType; 3] = [
-        DissolveType::None,
-        DissolveType::All,
-        DissolveType::List,
-    ];
+    pub const ALL: [DissolveType; 3] = [DissolveType::None, DissolveType::All, DissolveType::List];
 
     pub fn i18n_key(self) -> &'static str {
         match self {
@@ -266,22 +262,13 @@ pub fn run(layer: &Layer, params: &BufferParams) -> Result<Layer, String> {
 
     let mut polygons: Vec<PolygonData> = Vec::new();
     for members in &groups {
-        let reference = members
-            .iter()
-            .map(|i| distances[*i].abs())
-            .sum::<f64>()
-            / members.len() as f64;
+        let reference =
+            members.iter().map(|i| distances[*i].abs()).sum::<f64>() / members.len() as f64;
         if !reference.is_finite() || reference == 0.0 {
             return Err("缓冲距离不能为 0".to_string());
         }
         let (center, span) = group_frame(&features, members);
-        let scale = MetricScale::new(
-            layer.projection.model,
-            center,
-            reference,
-            span,
-            params.unit,
-        )?;
+        let scale = MetricScale::new(layer.projection.model, center, reference, span, params.unit)?;
 
         let mut pieces: Vec<MultiPolygon<f64>> = Vec::with_capacity(members.len());
         let mut originals: Vec<MultiPolygon<f64>> = Vec::new();
@@ -318,7 +305,12 @@ pub fn run(layer: &Layer, params: &BufferParams) -> Result<Layer, String> {
         return Err("缓冲结果为空（距离过小或要素退化）".to_string());
     }
 
-    let mut result = Layer::from_geometry(default_output_name(&layer.name), Vec::new(), Vec::new(), polygons);
+    let mut result = Layer::from_geometry(
+        default_output_name(&layer.name),
+        Vec::new(),
+        Vec::new(),
+        polygons,
+    );
     result.projection = layer.projection.clone();
     // 缓冲区用半透明强调色填充，与源图层区分。
     result.style.fill = crate::style::ACCENT.gamma_multiply(0.45);
@@ -334,7 +326,7 @@ pub fn run(layer: &Layer, params: &BufferParams) -> Result<Layer, String> {
 /// `"properties": {}`；叠加分析（裁剪 / 相交 / 联合 / 合并 / 融合）的结果带
 /// 属性，必须落盘，否则输出文件会丢字段。
 pub fn write_geojson(layer: &Layer, path: &Path) -> Result<(), String> {
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
 
     let ring_value = |ring: &[Coord2D]| -> Value {
         let mut coords: Vec<Value> = Vec::with_capacity(ring.len() + 1);
@@ -633,10 +625,7 @@ fn group_indices(layer: &Layer, features: &[Feature], params: &BufferParams) -> 
                     order.push(key.clone());
                     buckets.insert(key.clone(), Vec::new());
                 }
-                buckets
-                    .get_mut(&key)
-                    .expect("刚插入的分组必然存在")
-                    .push(i);
+                buckets.get_mut(&key).expect("刚插入的分组必然存在").push(i);
             }
             order
                 .into_iter()
@@ -1014,11 +1003,7 @@ fn ring_to_layer(ring: &LineString<f64>, scale: &MetricScale) -> Option<Vec<Coor
             break;
         }
     }
-    if pts.len() >= 3 {
-        Some(pts)
-    } else {
-        None
-    }
+    if pts.len() >= 3 { Some(pts) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,7 +1088,10 @@ mod tests {
         let out = run(&layer, &params(500.0)).expect("缓冲区应成功");
         let area = total_outer_area(&out);
         let ideal = std::f64::consts::PI * 500.0 * 500.0;
-        assert!(area <= ideal, "多边形近似面积不应超过理想圆：{area} vs {ideal}");
+        assert!(
+            area <= ideal,
+            "多边形近似面积不应超过理想圆：{area} vs {ideal}"
+        );
         assert!(area > ideal * 0.98, "面积偏差过大：{area} vs {ideal}");
         assert_eq!(out.hole_rings.len(), 0, "点缓冲不应有孔");
     }
@@ -1120,17 +1108,15 @@ mod tests {
         let area = total_outer_area(&out);
         // 矩形 1000x200 + 两端半圆（半径 100）
         let ideal = 1000.0 * 200.0 + std::f64::consts::PI * 100.0 * 100.0;
-        assert!((area - ideal).abs() / ideal < 0.01, "面积偏差过大：{area} vs {ideal}");
+        assert!(
+            (area - ideal).abs() / ideal < 0.01,
+            "面积偏差过大：{area} vs {ideal}"
+        );
     }
 
     #[test]
     fn square_polygon_buffer_grows_with_round_corners() {
-        let square = vec![
-            [0.0, 0.0],
-            [100.0, 0.0],
-            [100.0, 100.0],
-            [0.0, 100.0],
-        ];
+        let square = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]];
         let layer = Layer::from_geometry(
             "poly".to_string(),
             Vec::new(),
@@ -1143,18 +1129,16 @@ mod tests {
         let out = run(&layer, &params(10.0)).expect("缓冲区应成功");
         let area = total_outer_area(&out);
         let ideal = 100.0 * 100.0 + 4.0 * 100.0 * 10.0 + std::f64::consts::PI * 10.0 * 10.0;
-        assert!((area - ideal).abs() / ideal < 0.01, "面积偏差过大：{area} vs {ideal}");
+        assert!(
+            (area - ideal).abs() / ideal < 0.01,
+            "面积偏差过大：{area} vs {ideal}"
+        );
         assert_eq!(out.hole_rings.len(), 0);
     }
 
     #[test]
     fn outside_only_keeps_input_face_as_hole() {
-        let square = vec![
-            [0.0, 0.0],
-            [100.0, 0.0],
-            [100.0, 100.0],
-            [0.0, 100.0],
-        ];
+        let square = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]];
         let layer = Layer::from_geometry(
             "poly".to_string(),
             Vec::new(),
@@ -1170,17 +1154,15 @@ mod tests {
         assert_eq!(out.outer_rings.len(), 1);
         assert_eq!(out.hole_rings.len(), 1, "输入面应被挖成孔");
         let hole = total_hole_area(&out);
-        assert!((hole - 10000.0).abs() / 10000.0 < 1e-6, "孔面积应等于输入面：{hole}");
+        assert!(
+            (hole - 10000.0).abs() / 10000.0 < 1e-6,
+            "孔面积应等于输入面：{hole}"
+        );
     }
 
     #[test]
     fn negative_distance_erodes_polygon() {
-        let square = vec![
-            [0.0, 0.0],
-            [100.0, 0.0],
-            [100.0, 100.0],
-            [0.0, 100.0],
-        ];
+        let square = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]];
         let layer = Layer::from_geometry(
             "poly".to_string(),
             Vec::new(),
@@ -1192,7 +1174,10 @@ mod tests {
         );
         let out = run(&layer, &params(-10.0)).expect("缓冲区应成功");
         let area = total_outer_area(&out);
-        assert!((area - 6400.0).abs() / 6400.0 < 0.05, "向内缓冲面积应接近 80x80：{area}");
+        assert!(
+            (area - 6400.0).abs() / 6400.0 < 0.05,
+            "向内缓冲面积应接近 80x80：{area}"
+        );
     }
 
     #[test]
@@ -1203,19 +1188,17 @@ mod tests {
             Vec::new(),
             vec![PolygonData {
                 outer: vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]],
-                holes: vec![vec![
-                    [40.0, 40.0],
-                    [40.0, 60.0],
-                    [60.0, 60.0],
-                    [60.0, 40.0],
-                ]],
+                holes: vec![vec![[40.0, 40.0], [40.0, 60.0], [60.0, 60.0], [60.0, 40.0]]],
             }],
         );
         let out = run(&layer, &params(5.0)).expect("缓冲区应成功");
         assert_eq!(out.hole_rings.len(), 1, "孔应保留");
         let hole = total_hole_area(&out);
         // 孔是 40..60 的 20x20；正距离缓冲让外环外扩、孔向内收缩 5 ⇒ 10x10。
-        assert!((hole - 100.0).abs() / 100.0 < 0.01, "孔应从 20x20 收缩到 10x10：{hole}");
+        assert!(
+            (hole - 100.0).abs() / 100.0 < 0.01,
+            "孔应从 20x20 收缩到 10x10：{hole}"
+        );
     }
 
     #[test]
@@ -1295,7 +1278,10 @@ mod tests {
             }
         }
         let ratio = (max[0] - min[0]) / (max[1] - min[1]);
-        assert!((ratio - 2.0_f64.sqrt()).abs() < 0.05, "经纬跨度比应接近 1/cos45：{ratio}");
+        assert!(
+            (ratio - 2.0_f64.sqrt()).abs() < 0.05,
+            "经纬跨度比应接近 1/cos45：{ratio}"
+        );
     }
 
     #[test]
@@ -1324,7 +1310,10 @@ mod tests {
         let area = total_outer_area(&out);
         // 半侧条带 1000x100 + 端部半圆（外端为 1/4 圆 + 起点 1/4 圆）
         let ideal = 1000.0 * 100.0 + 0.5 * std::f64::consts::PI * 100.0 * 100.0;
-        assert!((area - ideal).abs() / ideal < 0.05, "面积偏差过大：{area} vs {ideal}");
+        assert!(
+            (area - ideal).abs() / ideal < 0.05,
+            "面积偏差过大：{area} vs {ideal}"
+        );
     }
 
     #[test]
@@ -1380,7 +1369,10 @@ mod tests {
         // 写盘 + 重新导入：结果必须是可解析的 GeoJSON 面。
         let out_path = {
             let mut q = std::env::temp_dir();
-            q.push(format!("rustgis_buffer_e2e_out_{}.geojson", std::process::id()));
+            q.push(format!(
+                "rustgis_buffer_e2e_out_{}.geojson",
+                std::process::id()
+            ));
             q
         };
         write_geojson(&out, &out_path).expect("写结果 GeoJSON");
@@ -1413,7 +1405,10 @@ mod tests {
         };
         let out = run(&layer, &p).expect("缓冲区应成功");
         let area = total_outer_area(&out);
-        assert!((area - 6400.0).abs() / 6400.0 < 0.05, "字段负距离应向内侵蚀：{area}");
+        assert!(
+            (area - 6400.0).abs() / 6400.0 < 0.05,
+            "字段负距离应向内侵蚀：{area}"
+        );
     }
 
     /// 末端类型只影响线：ROUND = 两端半圆、FLAT = 平切、SQUARE = 沿走向外延半径。
@@ -1430,9 +1425,16 @@ mod tests {
             p.end = end;
             total_outer_area(&run(&layer, &p).expect("缓冲区应成功"))
         };
-        let (r, flat, square) = (area_for(EndType::Round), area_for(EndType::Flat), area_for(EndType::Square));
+        let (r, flat, square) = (
+            area_for(EndType::Round),
+            area_for(EndType::Flat),
+            area_for(EndType::Square),
+        );
         // 条带 1000×200 = 20 万；圆端 + 一个整圆、平端 + 0、方端 + 4·r²。
-        assert!((flat - 200_000.0).abs() / 200_000.0 < 0.01, "平端面积：{flat}");
+        assert!(
+            (flat - 200_000.0).abs() / 200_000.0 < 0.01,
+            "平端面积：{flat}"
+        );
         assert!(
             (r - (200_000.0 + std::f64::consts::PI * 100.0 * 100.0)).abs() / r < 0.02,
             "圆端面积：{r}"
@@ -1462,7 +1464,10 @@ mod tests {
         };
         let (left_area, left_bounds) = side_box(SideType::Left);
         let (right_area, right_bounds) = side_box(SideType::Right);
-        assert!((left_area - right_area).abs() / left_area < 1e-6, "两侧面积应相同");
+        assert!(
+            (left_area - right_area).abs() / left_area < 1e-6,
+            "两侧面积应相同"
+        );
         // 线沿 +x：左侧在 +y（0..100），右侧在 -y（-100..0）。
         assert!((left_bounds.min[1] - 0.0).abs() < 1e-6);
         assert!((right_bounds.max[1] - 0.0).abs() < 1e-6);
@@ -1498,7 +1503,8 @@ mod tests {
         let line: Vec<Coord2D> = (0..5000)
             .map(|i| [i as f64 * 10.0, (i as f64 * 0.05).sin() * 500.0])
             .collect();
-        let mut layer = Layer::from_geometry("line".to_string(), Vec::new(), vec![line], Vec::new());
+        let mut layer =
+            Layer::from_geometry("line".to_string(), Vec::new(), vec![line], Vec::new());
         layer.projection = projected();
         let started = Instant::now();
         let out = run(&layer, &params(30.0)).expect("缓冲区应成功");
@@ -1542,7 +1548,8 @@ mod tests {
         let line: Vec<Coord2D> = (0..5000)
             .map(|i| [i as f64 * 10.0, (i as f64 * 0.05).sin() * 500.0])
             .collect();
-        let mut layer = Layer::from_geometry("line".to_string(), Vec::new(), vec![line], Vec::new());
+        let mut layer =
+            Layer::from_geometry("line".to_string(), Vec::new(), vec![line], Vec::new());
         layer.projection = projected();
         let mut p = params(30.0);
         p.side = SideType::Left;
@@ -1565,12 +1572,7 @@ mod tests {
                 let x = (i % 20) as f64 * 10.0;
                 let y = (i / 20) as f64 * 10.0;
                 PolygonData {
-                    outer: vec![
-                        [x, y],
-                        [x + 20.0, y],
-                        [x + 20.0, y + 20.0],
-                        [x, y + 20.0],
-                    ],
+                    outer: vec![[x, y], [x + 20.0, y], [x + 20.0, y + 20.0], [x, y + 20.0]],
                     holes: Vec::new(),
                 }
             })
@@ -1637,7 +1639,10 @@ mod tests {
         p.end = EndType::Flat;
         let out = run(&layer, &p).expect("缓冲区应成功");
         let area = total_outer_area(&out);
-        assert!((area - 100_000.0).abs() / 100_000.0 < 0.01, "单侧平端面积：{area}");
+        assert!(
+            (area - 100_000.0).abs() / 100_000.0 < 0.01,
+            "单侧平端面积：{area}"
+        );
     }
 
     /// 多段折线（含拐角）在默认圆角连接下的面积应大于「各段矩形之和」，

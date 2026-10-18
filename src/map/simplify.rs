@@ -341,7 +341,13 @@ mod tests {
     #[test]
     fn dedup_collapses_coincident_points() {
         let (rect, view) = identity_view();
-        let ring = world(&[(0.0, 0.0), (10.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 0.0)]);
+        let ring = world(&[
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 0.0),
+        ]);
         let pts = stroke_path(&ring, rect, &view, true);
         // 重复点被去掉，闭合环的收尾重复点也去掉
         assert_eq!(pts.len(), 3);
@@ -364,7 +370,13 @@ mod tests {
     fn clean_paths_are_left_alone() {
         let (rect, view) = identity_view();
         // 一个规整的矩形环：清理后应保持原样
-        let ring = world(&[(0.0, 0.0), (80.0, 0.0), (80.0, 60.0), (0.0, 60.0), (0.0, 0.0)]);
+        let ring = world(&[
+            (0.0, 0.0),
+            (80.0, 0.0),
+            (80.0, 60.0),
+            (0.0, 60.0),
+            (0.0, 0.0),
+        ]);
         let pts = stroke_path(&ring, rect, &view, true);
         assert_eq!(pts.len(), 4);
         assert!(max_miter(&pts, true) < 2.0);
@@ -415,11 +427,7 @@ mod tests {
         }
         let (rect, view) = identity_view();
         let pts = stroke_path(&world(&ring), rect, &view, true);
-        assert!(
-            pts.len() < 400,
-            "抽稀不足：4000 个顶点只降到 {}",
-            pts.len()
-        );
+        assert!(pts.len() < 400, "抽稀不足：4000 个顶点只降到 {}", pts.len());
         assert!(pts.len() >= 8, "抽稀过度：只剩 {} 个顶点", pts.len());
     }
 
@@ -525,7 +533,10 @@ mod tests {
         println!("触发失控 miter 的环：清理前 {raw_bad} / 清理后 {fixed_bad}");
         println!("描边顶点数：清理前 {raw_pts} / 清理后 {fixed_pts}");
         for d in details.iter().take(12) {
-            println!("  残留：原始 {} 顶点 → 清理后 {} 顶点，max miter = {:.1}", d.0, d.1, d.2);
+            println!(
+                "  残留：原始 {} 顶点 → 清理后 {} 顶点，max miter = {:.1}",
+                d.0, d.1, d.2
+            );
         }
         assert_eq!(fixed_bad, 0, "清理后仍有环会画出尖刺");
         assert!(raw_bad > 0, "该文件未复现问题，换一份数据试试");

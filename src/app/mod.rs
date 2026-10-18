@@ -1,4 +1,4 @@
-//! 主应用：窗口布局（菜单条 / 地图视图 / 图层面板 / 状态栏 / 模态对话框）。
+//! RustGIS 主应用：应用状态、主循环与菜单分发。
 //!
 //! 模块按职责拆分（本文件只保留「应用状态 + 主循环 + 菜单分发」）：
 //! - [`layers_panel`]：左侧「内容列表」（TOC）面板——图层树、拖拽重排、右键菜单；
@@ -7,7 +7,9 @@
 //! - [`import`]：图层导入后台流水线（选文件 → 后台解析 / 三角化）；
 //! - [`buffer_dialog`]：缓冲区分析对话框 + 后台缓冲流水线；
 //! - [`geoprocess_dialog`]：叠加类地理处理工具（裁剪 / 相交 / 联合 / 合并 / 融合）；
-//! - [`project_op`]：工程文件打开 / 保存后台流水线（含系统"保存更改？"提示）。
+//! - [`project_op`]：工程文件打开 / 保存后台流水线（含系统"保存更改？"提示）；
+//! - [`raster_dialog`]：栅格图层属性对话框（常规 / 源 / 范围 / 显示 / 符号系统 / 时间）；
+//! - [`raster_op`]：栅格导入、统计与金字塔后台流水线（v0.3）。
 //!
 //! UI 线程只做非阻塞轮询：导入 / 打开 / 保存的重活都在后台线程
 //! （[`ImportStage`](import::ImportStage) / [`ProjectStage`](project_op::ProjectStage)），
@@ -19,6 +21,9 @@ pub mod import;
 pub mod layers_panel;
 pub mod map_view;
 pub mod project_op;
+pub mod raster_dialog;
+pub mod raster_op;
+pub mod toast;
 pub mod widgets;
 
 use std::path::PathBuf;
@@ -28,7 +33,7 @@ use egui::{CentralPanel, SidePanel, TopBottomPanel, ViewportCommand};
 use crate::dialog::{self, Dialog};
 use crate::fonts;
 use crate::geo::overlay;
-use crate::geo::{CrsId, LayerManager, ProjectionInfo, ProjectionModel};
+use crate::geo::{Aabb, CrsId, LayerManager, ProjectionInfo, ProjectionModel};
 use crate::i18n::Language;
 use crate::map::{self, MapState, Tool};
 use crate::menus;
@@ -38,6 +43,21 @@ use self::buffer_dialog::{BufferJob, BufferWindow};
 use self::geoprocess_dialog::{GeoJob, GeoWindow};
 use self::import::ImportStage;
 use self::project_op::{AfterSave, ProjectStage};
+use self::raster_op::{PyramidPrompt, RasterJob, RasterStage};
+
+/// 全局界面缩放（egui `zoom_factor`）：1.25×。
+///
+/// egui 按 96 DPI（1pt = 1px @100%）排版，默认字号 14pt；在 1440p 等高分屏上
+/// 按 100% 缩放显示时，菜单栏 / 图层面板 / 状态栏文字明显偏小，观感"分辨率低"。
+/// 这里把整套 UI 放大 1.25×（等效 Windows 150% 缩放），文字与控件按比例变大，
+/// 仍逐像素渲染、不发虚。
+///
+/// 与地图缩放（`map::MapView`，滚轮 / 双击）无关：滚轮只改变视图比例尺，
+/// 事件在 `map_view.rs` 内被消费，不触碰界面缩放。
+///
+/// eframe 0.31 未启用 `persistence`，每次启动都是新的 `Context`，
+/// 因此这个默认值确定性地生效。
+const UI_ZOOM: f32 = 1.00;
 
 /// 投影模型 → i18n key（状态栏第三段用）。
 fn model_i18n_key(model: ProjectionModel) -> &'static str {
@@ -92,6 +112,11 @@ pub struct RustGisApp {
     map_rect: Option<egui::Rect>,
     /// 下一帧将视图适配到全部数据范围。
     needs_fit: bool,
+    /// 下一帧将视图适配到指定范围（右键菜单「缩放至图层 / 缩放至组」）。
+    ///
+    /// 右键菜单回调里拿不到地图控件的精确像素矩形，故与 `needs_fit` 一样延迟到
+    /// 下一帧的地图面板里消费。
+    zoom_extent: Option<Aabb>,
     /// 鼠标在地图区域内的世界坐标（状态栏显示）。
     cursor_world: Option<[f64; 2]>,
     /// 正在被拖拽的图层（`Some` 时只画落点指示器；真正的移动在鼠标松开时才发生）。
@@ -108,6 +133,25 @@ pub struct RustGisApp {
     dirty: bool,
     /// 工程后台流水线（打开 / 另存为 / 保存 / 加载）。
     project_op: Option<ProjectStage>,
+    /// 栅格导入流水线（等待文件选择 / 等待后台打开 + 读元数据）。
+    raster_stage: Option<RasterStage>,
+    /// 栅格后台任务（统计 / 金字塔构建），同一时刻只跑一个。
+    raster_job: Option<RasterJob>,
+    /// 因任务忙碌而排队等待开始构建金字塔的图层。
+    pending_pyramid: Option<u64>,
+    /// "是否构建金字塔"提示窗口。
+    raster_prompt: Option<PyramidPrompt>,
+    /// 栅格图层属性对话框（双击图层或右键「属性」打开）。
+    raster_props: Option<raster_dialog::RasterProps>,
+    /// 栅格纹理缓存与绘制器（跨帧复用，避免每帧重新解码）。
+    raster_painter: crate::raster::RasterPainter,
+    /// 右下角通知队列（后台任务完成提示，见 [`toast`]）。
+    toasts: toast::ToastHost,
+    /// 用户拖进窗口、尚未开始导入的文件（按顺序逐个交给导入流水线）。
+    ///
+    /// 拖放可能一次给出多个文件，而导入流水线同一时刻只跑一条（否则两个系统
+    /// 对话框 / 两条解析线程会互相打断，完成通知也交错），因此先排队。
+    drop_queue: std::collections::VecDeque<PathBuf>,
     /// 用户已确认退出（点了"不保存"或保存完成）：下一帧真正关闭窗口。
     exiting: bool,
     /// 为 `true` 时下一帧刷新标题栏（改变工程名的操作入口拿不到 `ctx` 时用）。
@@ -119,15 +163,26 @@ impl RustGisApp {
     /// 因此测试里可以用 `Context::default()` 无头跑整块界面。
     pub fn new(ctx: &egui::Context) -> Self {
         // 整应用白底浅色主题：色板与 `Visuals` 统一收敛在 `style` 模块。
+        // 必须先固定浅色主题再写 visuals：egui 的 `set_visuals` 只写入"当前主题"
+        // 对应的 style 槽位，而 eframe 创建期系统主题尚未到达（默认偏好 System、
+        // 回退 Dark），直接写会落进深色槽位；首帧系统报告浅色后，实际生效的却是
+        // egui 默认浅色主题（面板底 248 灰、菜单文字 60 灰、分隔线 190 灰），
+        // 自定主题整体失效。产品界面固定为白底浅色，不跟随系统深色模式。
+        ctx.set_theme(egui::ThemePreference::Light);
         ctx.set_visuals(style::visuals());
+
+        // 高分屏下 1:1 排版的界面偏小：整体放大 UI_ZOOM 倍（详见常量注释）。
+        // `new()` 在首帧之前执行，缩放自第一帧起生效。
+        ctx.set_zoom_factor(UI_ZOOM);
 
         let language = Language::from_system();
 
-        // 内置字体不含 CJK 字形，必须加载系统中文字体，否则显示为方框。
-        let font_info = match fonts::install_system_cjk_font(ctx) {
-            Some(path) => format!("{}: {}", language.t("dialog.about.font"), path.display()),
-            None => language.t("dialog.about.nofont").to_string(),
-        };
+        // 内置字体不含 CJK 字形，安装编译期内嵌的阿里巴巴普惠体，否则显示为方框。
+        let font_info = format!(
+            "{}: {}",
+            language.t("dialog.about.font"),
+            fonts::install_cjk_font(ctx)
+        );
 
         Self {
             status: Status::Ready,
@@ -144,12 +199,21 @@ impl RustGisApp {
             geo_job: None,
             map_rect: None,
             needs_fit: false,
+            zoom_extent: None,
             cursor_world: None,
             layer_drag: None,
             project_projection: None,
             project_path: None,
             dirty: false,
             project_op: None,
+            raster_stage: None,
+            raster_job: None,
+            pending_pyramid: None,
+            raster_prompt: None,
+            raster_props: None,
+            raster_painter: crate::raster::RasterPainter::default(),
+            toasts: toast::ToastHost::default(),
+            drop_queue: std::collections::VecDeque::new(),
             exiting: false,
             title_dirty: false,
         }
@@ -237,6 +301,16 @@ impl RustGisApp {
                 self.pick_and_add_layer();
                 MenuAction::None
             }
+            // 插入 → 添加栅格图层（v0.3）：TIF / GeoTIFF 后台打开。
+            "layer.addRaster" => {
+                self.pick_and_add_raster();
+                MenuAction::None
+            }
+            // 插入 → 添加 Sentinel-2 SAFE 产品包（v0.4）：SAFE 是目录，选择文件夹。
+            "layer.addSafe" => {
+                self.pick_and_add_safe();
+                MenuAction::None
+            }
             // 地理处理 → 缓冲区：ArcGIS 风格参数对话框（确定后结果自动加入地图）。
             "overlay.buffer" => {
                 self.open_buffer_dialog();
@@ -295,6 +369,12 @@ impl eframe::App for RustGisApp {
         self.poll_buffer_job(ctx);
         // 后台地理处理流水线推进（裁剪 / 相交 / 联合 / 合并 / 融合）
         self.poll_geo_job(ctx);
+        // 后台栅格流水线推进（导入 / 统计 / 金字塔构建，不阻塞主线程）
+        self.poll_raster_stage(ctx);
+        self.poll_raster_job(ctx);
+        // 拖进窗口的文件：先入队，再在流水线空闲时逐个启动（导入 / 栅格）。
+        self.handle_dropped_files(ctx);
+        self.poll_drop_queue();
 
         // 退出流程：用户已确认退出（"不保存"或保存完成）→ 真正关闭窗口。
         if self.exiting {
@@ -322,9 +402,7 @@ impl eframe::App for RustGisApp {
         // 另加 1px 发丝线描边做面板分隔（白色界面上不用色块、只用细线）。
         // 注意 `Frame::side_top_panel` 接收的是 `&Style`（不是 `&Visuals`）。
         let panel_style = ctx.style();
-        let panel_frame = || {
-            egui::Frame::side_top_panel(&panel_style).stroke(style::hairline())
-        };
+        let panel_frame = || egui::Frame::side_top_panel(&panel_style).stroke(style::hairline());
 
         // 顶部菜单栏
         TopBottomPanel::top("menu_bar")
@@ -342,11 +420,21 @@ impl eframe::App for RustGisApp {
             .show(ctx, |ui| self.layers_panel(ui));
 
         // 底部状态栏
-        TopBottomPanel::bottom("status_bar")
+        let status_bar = TopBottomPanel::bottom("status_bar")
             .frame(panel_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // 地图正在渲染（还有块在解码 / 没到齐）：在状态文本左边转一个
+                    // 蓝色圆环，圆弧长度就是「已贴上的块 / 视口需要的块」。
+                    if let Some(progress) = self.raster_painter.progress() {
+                        widgets::render_ring(ui, progress);
+                    }
                     ui.label(self.status_text());
+                    // 栅格后台任务的进度（统计 / 金字塔构建）。
+                    if let Some(job) = self.raster_job_status() {
+                        ui.separator();
+                        ui.weak(job);
+                    }
                     ui.separator();
                     if let Some(w) = self.cursor_world {
                         ui.weak(self.tf(
@@ -355,12 +443,32 @@ impl eframe::App for RustGisApp {
                         ));
                         ui.separator();
                     }
+                    // 比例尺（与 QGIS / ArcGIS 状态栏同一读法）：1 屏幕像素代表多少米。
+                    // 分母按 0.28 mm/像素 折算，便于和桌面 GIS 的「比例 1:xxxxx」对照。
+                    if let Some(view) = self.map.view {
+                        let ppp = f64::from(ui.ctx().pixels_per_point()).max(1.0);
+                        let metres = 1.0 / (f64::from(view.scale) * ppp).max(f64::EPSILON);
+                        if metres.is_finite() && metres > 0.0 {
+                            ui.weak(self.tf(
+                                "status.scale",
+                                &[
+                                    &format!("{:.0}", metres / 0.000_28),
+                                    &format!("{metres:.2}"),
+                                ],
+                            ));
+                            ui.separator();
+                        }
+                    }
                     ui.weak(self.status_meta_text());
                 });
             });
 
         // 中央地图视图
         CentralPanel::default().show(ctx, |ui| self.map_panel(ui));
+
+        // 右下角通知：压在地图之上、模态对话框之下，不遮挡需要确认的窗口；
+        // 底部按状态栏实际高度抬起，不盖住坐标 / 比例尺。
+        self.toasts.show(ctx, status_bar.response.rect.height());
 
         // 模态对话框（位于最上层）；用户点"确定"后关闭。
         // （"保存更改？"提示已改为系统原生对话框，见 ask_save_changes。）
@@ -375,5 +483,9 @@ impl eframe::App for RustGisApp {
 
         // 「地理处理」对话框（裁剪 / 相交 / 联合 / 合并 / 融合，同一个窗口）。
         self.show_geoprocess_dialog(ctx);
+
+        // 「是否构建金字塔」提示 + 栅格图层属性对话框。
+        self.show_pyramid_prompt(ctx);
+        self.show_raster_props(ctx);
     }
 }

@@ -9,7 +9,7 @@
 //! 剖分算法本身（含孔洞处理、耳切顺序）由 `earcut` 提供，这里不再自研。
 //! 退化输入（点少于 3 个、共线、含 NaN/Inf）一律返回空三角，绝不 panic。
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
 
 use geo::algorithm::triangulate_earcut::TriangulateEarcut;
@@ -44,11 +44,7 @@ pub fn triangulate_polygons(outers: &[Vec<[f64; 2]>], holes: &[Vec<Vec<[f64; 2]>
     }
 
     let vertices: usize = outers.iter().map(|ring| ring.len()).sum::<usize>()
-        + holes
-            .iter()
-            .flatten()
-            .map(|ring| ring.len())
-            .sum::<usize>();
+        + holes.iter().flatten().map(|ring| ring.len()).sum::<usize>();
 
     let workers = worker_count(outers.len(), vertices);
     if workers <= 1 {
@@ -242,7 +238,9 @@ mod tests {
         all_bad.retain(|p| p[0].is_finite());
         assert!(total_area(&triangulate_rings(&[all_bad])) > 0.0);
         // 只剩 2 个有限点时返回空。
-        assert!(triangulate_rings(&[vec![[0.0, 0.0], [1.0, 1.0], [f64::NAN, f64::NAN]]]).is_empty());
+        assert!(
+            triangulate_rings(&[vec![[0.0, 0.0], [1.0, 1.0], [f64::NAN, f64::NAN]]]).is_empty()
+        );
     }
 
     #[test]

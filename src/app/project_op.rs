@@ -107,7 +107,9 @@ impl RustGisApp {
                 .show();
             let choice = match result {
                 rfd::MessageDialogResult::Custom(label) if label == save => SaveChoice::Save,
-                rfd::MessageDialogResult::Custom(label) if label == dont_save => SaveChoice::Discard,
+                rfd::MessageDialogResult::Custom(label) if label == dont_save => {
+                    SaveChoice::Discard
+                }
                 _ => SaveChoice::Cancel,
             };
             let _ = tx.send(choice);
@@ -143,6 +145,7 @@ impl RustGisApp {
     fn do_new(&mut self) {
         self.layers = LayerManager::default();
         self.map.view = None; // 下一帧按默认范围自动适配
+        self.zoom_extent = None; // 丢弃旧工程排队的「缩放至图层」
         self.project_projection = None; // 新工程从"未设置投影"开始
         self.project_path = None;
         self.dirty = false;
@@ -326,11 +329,20 @@ impl RustGisApp {
                 Ok(Ok(data)) => {
                     self.layers.replace_with(data.nodes);
                     self.map.view = data.view; // None 时下一帧自动适配
+                    self.zoom_extent = None; // 丢弃上一个工程排队的「缩放至图层」
                     self.project_projection = data.projection; // 旧版本文件 → None（未设置）
                     self.project_path = Some(path);
                     self.dirty = false;
                     self.title_dirty = true;
-                    self.status = Status::Message(self.tf("status.opened", &[&name]));
+                    // 栅格源文件缺失等非致命问题：只提示，不影响工程其余部分。
+                    if data.warnings.is_empty() {
+                        self.status = Status::Message(self.tf("status.opened", &[&name]));
+                    } else {
+                        let body = data.warnings.join("\n");
+                        self.status =
+                            Status::Message(self.tf("status.openedWithWarnings", &[&name]));
+                        self.dialog = Some(Dialog::Error { body });
+                    }
                 }
                 Ok(Err(e)) => {
                     self.status = Status::Message(self.tf("status.loadError", &[&e]));

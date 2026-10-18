@@ -45,13 +45,13 @@ pub fn show(ctx: &Context, d: &Dialog, lang: Language, font_info: &str) -> bool 
                     ui.add_space(6.0);
                     ui.strong(lang.tf("dialog.developHeading", &[feature]));
                     ui.add_space(6.0);
-                    ui.label(RichText::new(lang.t("dialog.developBody")).weak());
+                    ui.label(lang.t("dialog.developBody"));
                 }
                 Dialog::Error { body } => {
                     ui.add_space(6.0);
                     ui.strong(lang.t("dialog.errorTitle"));
                     ui.add_space(6.0);
-                    ui.label(RichText::new(body).weak());
+                    ui.label(body);
                 }
                 Dialog::About => {
                     ui.add_space(6.0);
@@ -59,10 +59,10 @@ pub fn show(ctx: &Context, d: &Dialog, lang: Language, font_info: &str) -> bool 
                     ui.add_space(4.0);
                     ui.label(lang.t("dialog.aboutSubtitle"));
                     ui.add_space(4.0);
-                    ui.label(RichText::new(lang.t("dialog.aboutTagline")).weak());
-                    ui.label(RichText::new(lang.t("dialog.aboutLicense")).weak());
+                    ui.label(lang.t("dialog.aboutTagline"));
+                    ui.label(lang.t("dialog.aboutLicense"));
                     ui.add_space(8.0);
-                    ui.label(RichText::new(font_info).weak().small());
+                    ui.label(RichText::new(font_info).small());
                 }
             }
             ui.add_space(16.0);
