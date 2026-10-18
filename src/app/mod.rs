@@ -86,8 +86,13 @@ pub enum MenuAction {
 /// 主应用状态。
 pub struct RustGisApp {
     status: Status,
-    /// 当前模态对话框（None 表示无）。
+    /// 当前要显示的模态提示内容（None 表示无）。
+    ///
+    /// 只是"该显示什么"；真正的系统原生窗口在 [`dialog::NativeDialog`] 里
+    /// （后台线程弹出，见 [`RustGisApp::show_dialog`]）。
     dialog: Option<Dialog>,
+    /// 已在后台弹出的系统原生提示框（`Some` 时表示窗口正开着，等用户关闭）。
+    dialog_job: Option<dialog::NativeDialog>,
     /// 当前界面语言（启动时跟随系统，可在「帮助 → 语言」切换）。
     pub language: Language,
     /// “关于”对话框中展示的字体信息。
@@ -187,6 +192,7 @@ impl RustGisApp {
         Self {
             status: Status::Ready,
             dialog: None,
+            dialog_job: None,
             language,
             font_info,
             layers: LayerManager::default(),
@@ -270,6 +276,38 @@ impl RustGisApp {
         if let Status::Message(_) = self.status {
             self.status = Status::Ready;
         }
+    }
+
+    /// 模态提示框：**系统原生**窗口（见 [`crate::dialog`]）。
+    ///
+    /// 与「保存更改？」提示同一套约定：窗口在后台线程弹出并阻塞该线程，UI 循环
+    /// 只做非阻塞轮询，因此弹框开着时地图照样能平移缩放。
+    /// `self.dialog` 描述"要显示什么"，`self.dialog_job` 是真正开着的那个窗口。
+    pub(super) fn show_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(job) = self.dialog_job.as_ref() {
+            if !job.poll() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                return;
+            }
+            // 用户已关闭：内容没变就清空；期间换了新内容（例如又报了一个错）
+            // 则保留，下一帧重弹，不吞掉后到的提示。
+            let same = self.dialog.as_ref().is_some_and(|d| job.shows(d));
+            self.dialog_job = None;
+            if same {
+                self.dialog = None;
+            }
+            return;
+        }
+
+        let Some(d) = self.dialog.as_ref() else {
+            return;
+        };
+        self.dialog_job = Some(dialog::NativeDialog::open(
+            d,
+            self.language,
+            &self.font_info,
+        ));
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 
     /// 菜单项被点击时的统一入口（`key` 为 i18n key）。
@@ -470,13 +508,8 @@ impl eframe::App for RustGisApp {
         // 底部按状态栏实际高度抬起，不盖住坐标 / 比例尺。
         self.toasts.show(ctx, status_bar.response.rect.height());
 
-        // 模态对话框（位于最上层）；用户点"确定"后关闭。
-        // （"保存更改？"提示已改为系统原生对话框，见 ask_save_changes。）
-        if let Some(d) = self.dialog.as_ref()
-            && dialog::show(ctx, d, self.language, &self.font_info)
-        {
-            self.dialog = None;
-        }
+        // 模态提示框：系统原生窗口（后台线程弹出、这里每帧非阻塞轮询关闭）。
+        self.show_dialog(ctx);
 
         // 「缓冲区」对话框（非模态窗口：可以一边看地图一边调参数）。
         self.show_buffer_dialog(ctx);

@@ -7,15 +7,16 @@
 //! 1. [`RustGisApp::pick_and_add_raster`]：后台线程弹出系统文件对话框；
 //! 2. 选定后后台 [`RasterLayer::open`]（只读文件头与 GeoKey，不解码像素）；
 //! 3. 加入图层树后，后台顺序计算显示波段的统计值（已有内嵌统计值时直接复用）；
-//! 4. 影像较大且没有任何概览时，弹窗询问是否构建金字塔（用户确认后才构建）。
+//! 4. 影像较大且没有任何概览时，弹出**系统原生**询问框确认是否构建金字塔。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 
-use egui::{Align2, Context, RichText, Window};
+use egui::Context;
 
+use crate::dialog::{Confirm, Level};
 use crate::raster::{RasterLayer, format_bytes};
 
 use super::{RustGisApp, Status};
@@ -91,10 +92,12 @@ impl RasterJob {
     }
 }
 
-/// 「是否构建概览」的询问状态。
+/// 「是否构建概览」的系统原生询问状态。
 pub(super) struct PyramidPrompt {
     layer: u64,
     body: String,
+    /// 后台已弹出的原生询问框（`None` = 下一帧弹出）。
+    job: Option<Confirm>,
 }
 
 impl RustGisApp {
@@ -227,6 +230,7 @@ impl RustGisApp {
                                 "dialog.pyramidBody",
                                 &[&unique, &format!("{width}×{height}")],
                             ),
+                            job: None,
                         });
                     }
                 }
@@ -443,49 +447,46 @@ impl RustGisApp {
         self.start_raster_job(layer_id, RasterJobKind::Pyramid, handle, None);
     }
 
-    /// 「是否构建概览」模态询问窗（非阻塞，点按钮才继续）。
+    /// 「是否构建概览」：**系统原生**询问框（后台线程弹出、这里非阻塞轮询）。
+    ///
+    /// 与提示框（[`crate::dialog::NativeDialog`]）同一套约定：弹框开着时 UI
+    /// 循环照常运行；用户点「是」才开始构建金字塔，「否」/ 关闭窗口则跳过。
     pub(super) fn show_pyramid_prompt(&mut self, ctx: &Context) {
-        let Some(prompt) = self.raster_prompt.as_ref() else {
+        let Some((layer, body)) = self
+            .raster_prompt
+            .as_ref()
+            .map(|p| (p.layer, p.body.clone()))
+        else {
             return;
         };
-        let layer = prompt.layer;
-        let body = prompt.body.clone();
-        let mut confirmed = None;
-        let mut cancelled = false;
-        Window::new(self.t("dialog.pyramidTitle"))
-            .collapsible(false)
-            .resizable(false)
-            .min_width(360.0)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.label(RichText::new(body).strong());
-                ui.add_space(4.0);
-                ui.label(self.t("dialog.pyramidHint"));
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    if ui.button(self.t("dialog.yes")).clicked() {
-                        confirmed = Some(true);
-                    }
-                    if ui.button(self.t("dialog.no")).clicked() {
-                        confirmed = Some(false);
-                    }
-                });
-            });
-        match confirmed {
-            Some(true) => {
-                self.raster_prompt = None;
-                self.begin_pyramid(layer);
+
+        if self.raster_prompt.as_ref().is_some_and(|p| p.job.is_none()) {
+            let job = Confirm::open(
+                self.t("dialog.pyramidTitle").to_string(),
+                format!("{body}\n\n{}", self.t("dialog.pyramidHint")),
+                self.t("dialog.yes").to_string(),
+                self.t("dialog.no").to_string(),
+                Level::Info,
+            );
+            if let Some(prompt) = self.raster_prompt.as_mut() {
+                prompt.job = Some(job);
             }
-            Some(false) => {
-                self.raster_prompt = None;
-                cancelled = true;
-            }
-            None => {}
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
         }
-        if !cancelled {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
+        let Some(job) = self.raster_prompt.as_ref().and_then(|p| p.job.as_ref()) else {
+            return;
+        };
+        let Some(confirmed) = job.poll() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        };
+        self.raster_prompt = None;
+        if confirmed {
+            self.begin_pyramid(layer);
         }
+        ctx.request_repaint();
     }
 
     /// 取消某个图层正在进行的后台任务（删除图层 / 关闭工程时调用）。

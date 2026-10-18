@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 
+use egui::epaint::{Mesh, Vertex};
 use egui::{Color32, ColorImage, Rect, TextureHandle, TextureOptions, pos2};
 
 use super::{
@@ -21,6 +22,8 @@ use super::{
     SampleType, StretchType,
 };
 use crate::geo::Aabb;
+use crate::geo::ProjectionInfo;
+use crate::geo::proj::CrsTransform;
 use crate::map::{MapView, Projector};
 
 /// 每块细节贴图覆盖的屏幕像素边长。
@@ -28,6 +31,16 @@ use crate::map::{MapView, Projector};
 /// 块小则首屏补齐快（单块解码 ≈ 100 ms），块大则解码次数少。512 时 1450×740 的视口
 /// 只需 3×2 块，首块约 0.15 秒就能盖住中间区域。
 const TILE_SIDE: u32 = 512;
+/// 重投影时一块细节贴图的网格分段数（每边）。
+///
+/// 512 px 的块按 8 段切分，每 64 px 一个顶点：投影在块内的弯曲远小于一个像素，
+/// 主要是让块的四条边能随投影轻微折弯；接缝处相邻块用的是同一批像素坐标，故无缝。
+const TILE_GRID_SEGMENTS: usize = 8;
+/// 重投影时**整幅底图**的网格分段数（每边）。
+///
+/// 底图横跨整幅影像，UTM 影像投到经纬度工程里时整幅轮廓的梯形（乃至弧形边）
+/// 全靠这些分段撑出来；32 段对 10980 px 的 S2 影像约 343 px 一个顶点，已足够平滑。
+const BASE_GRID_SEGMENTS: usize = 32;
 /// 同时在解码的块数上限。
 ///
 /// 每块解码线程**自己开一份数据集**（实测 SAFE 打开约 10–12 ms，远小于单块 0.1–0.6 s
@@ -244,6 +257,10 @@ impl RasterPainter {
     }
 
     /// 绘制所有可见栅格图层（自底向上）。
+    ///
+    /// `project` 是工程 CRS：与图层 CRS 不同时，每块贴图不再贴成一个轴对齐矩形，
+    /// 而是细分成网格、逐顶点把「源 CRS 世界坐标 → 工程 CRS → 屏幕」变换后再三角化，
+    /// 这样 UTM 影像放进经纬度工程里会像 QGIS 一样被「扳」成梯形，边缘也随投影弯曲。
     pub fn paint(
         &mut self,
         ctx: &egui::Context,
@@ -251,6 +268,7 @@ impl RasterPainter {
         rect: Rect,
         view: &MapView,
         layers: &[&RasterLayer],
+        project: Option<&ProjectionInfo>,
     ) {
         if layers.is_empty() {
             self.states.clear();
@@ -268,9 +286,22 @@ impl RasterPainter {
             if !layer.visible {
                 continue;
             }
-            if layer.bounds.is_empty() || !layer.bounds.intersects(&visible) {
+            // 图层 CRS → 工程 CRS；同源或无法识别时为恒等（沿用原来的矩形贴图路径）。
+            let xf = project
+                .and_then(|p| CrsTransform::between(&layer.projection, p))
+                .filter(|xf| !xf.is_identity());
+            // 裁剪与窗口选择都要用**工程 CRS** 下的显示范围。
+            let shown_bounds = match &xf {
+                Some(xf) => xf.apply_aabb(layer.bounds),
+                None => layer.bounds,
+            };
+            if layer.bounds.is_empty() || !shown_bounds.intersects(&visible) {
                 continue;
             }
+            let source_visible = match &xf {
+                Some(xf) => xf.unapply_aabb(visible),
+                None => visible,
+            };
             let state = self.states.entry(layer.id).or_default();
             // 帧号只在绘制时推进：块的 `frame` 因此等价于「最近一次可见的帧」，
             // 淘汰时只动本帧没被用到的块（以前这里从不自增，LRU 实际是随机的）。
@@ -283,10 +314,13 @@ impl RasterPainter {
                 unfinished = true;
                 continue;
             };
-            let Some(window) = visible_window(&meta, layer.bounds.intersect(&visible)) else {
+            let Some(window) = visible_window(&meta, layer.bounds.intersect(&source_visible))
+            else {
                 continue;
             };
-            let Some(needed_screen) = pixel_window_screen_rect(&meta, &window, &projector) else {
+            let Some(needed_screen) =
+                pixel_window_screen_rect(&meta, &window, &projector, xf.as_ref())
+            else {
                 continue;
             };
             // 密度按**物理像素**算：纹理像素最终要落在物理屏幕上，界面里的一切长度
@@ -473,11 +507,22 @@ impl RasterPainter {
             }
 
             // 先画底图，再叠细节块：旧网格的块在下、当前网格的块在上。
-            if let Some(base) = &state.base
-                && let Some(screen) =
-                    pixel_window_screen_rect(&meta, &full_window(&meta), &projector)
-            {
-                Self::draw_texture(painter, &base.tex, screen);
+            if let Some(base) = &state.base {
+                let window = full_window(&meta);
+                if let Some(screen) =
+                    pixel_window_screen_rect(&meta, &window, &projector, xf.as_ref())
+                {
+                    Self::draw_texture(
+                        painter,
+                        &base.tex,
+                        &meta,
+                        &window,
+                        &projector,
+                        xf.as_ref(),
+                        BASE_GRID_SEGMENTS,
+                        screen,
+                    );
+                }
             }
             // 细节块：只要「显示设置/ 统计版本」没变、且没有被缩得太小，就继续按世界
             // 位置绘制——哪怕它属于上一个缩放网格。
@@ -487,7 +532,7 @@ impl RasterPainter {
             // 后逐块无缝替换；绝不会因为差一个缩放级别就整屏退回 768 px 底图（用户报
             // 的「放大变成一张糊掉的整幅图」）。只有缩小太多（1 个纹理像素要摊到 2 个
             // 以上屏幕像素）时才不画，避免混叠出横条——那种情况交给新网格重建。
-            let mut drawn: Vec<(bool, &CachedTile, Rect)> = state
+            let mut drawn: Vec<(bool, &CachedTile, PixelWindow, Rect)> = state
                 .tiles
                 .iter()
                 .filter(|(_, tile)| tile.version == meta.version && drawable(tile.density, density))
@@ -498,8 +543,9 @@ impl RasterPainter {
                         tile.window[2],
                         tile.window[3],
                     );
-                    let screen = pixel_window_screen_rect(&meta, &tile_window, &projector)?;
-                    Some((key.level == grid.level, tile, screen))
+                    let screen =
+                        pixel_window_screen_rect(&meta, &tile_window, &projector, xf.as_ref())?;
+                    Some((key.level == grid.level, tile, tile_window, screen))
                 })
                 .collect();
             // 当前网格的块最后画（盖在上面）。
@@ -509,8 +555,17 @@ impl RasterPainter {
             // 必须平移画面（改变帧号让旧块被淘汰）才恢复——正是用户反复报的
             // 「放大后不渲染当前层级，移动画面才正常」。
             drawn.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.density.total_cmp(&b.1.density)));
-            for (_, tile, screen) in drawn {
-                Self::draw_texture(painter, &tile.tex, screen);
+            for (_, tile, window, screen) in drawn {
+                Self::draw_texture(
+                    painter,
+                    &tile.tex,
+                    &meta,
+                    &window,
+                    &projector,
+                    xf.as_ref(),
+                    TILE_GRID_SEGMENTS,
+                    screen,
+                );
             }
 
             evict_tiles(state, tile_cap, replace_old, grid.level);
@@ -540,11 +595,40 @@ impl RasterPainter {
     }
 
     /// 贴一张已经合成好的纹理。
-    fn draw_texture(painter: &egui::Painter, tex: &TexPayload, screen: Rect) {
+    ///
+    /// 图层与工程同源（`xf == None`）时等价于 `painter.image`；需要重投影时把纹理
+    /// 细分成 `segments × segments` 网格，网格顶点逐个走「像素 → 源世界 → 工程世界 →
+    /// 屏幕」，于是整幅影像的轮廓随投影变成梯形 / 弧形，而不是被拉成一个矩形。
+    ///
+    /// 相邻块共用完全相同的像素坐标（窗口边界就是像素整数），因而分段后的接缝顶点
+    /// 也严格重合，重投影不会在块之间留下裂缝。
+    #[allow(clippy::too_many_arguments)]
+    fn draw_texture(
+        painter: &egui::Painter,
+        tex: &TexPayload,
+        meta: &DatasetSnapshot,
+        window: &PixelWindow,
+        projector: &Projector,
+        xf: Option<&CrsTransform>,
+        segments: usize,
+        screen: Rect,
+    ) {
         let Some(handle) = &tex.handle else {
             return;
         };
-        painter.image(handle.id(), screen, full_uv(), Color32::WHITE);
+        let Some(xf) = xf else {
+            painter.image(handle.id(), screen, full_uv(), Color32::WHITE);
+            return;
+        };
+        match warped_mesh(meta, window, projector, xf, segments, handle.id()) {
+            Some(mesh) => {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            // 极端参数下个别顶点跑到无穷远：整块退回矩形贴图，别画出撕裂的三角形。
+            None => {
+                painter.image(handle.id(), screen, full_uv(), Color32::WHITE);
+            }
+        }
     }
 
     /// 测试用：当前缓存的细节块总数。
@@ -571,6 +655,57 @@ impl RasterPainter {
             .get(&layer)
             .is_some_and(|state| state.base.is_some())
     }
+}
+
+/// 把一张纹理细分成网格、逐顶点重投影，返回可直接交给 egui 的三角形网格。
+///
+/// 顶点轨迹：像素坐标 → 源 CRS 世界坐标（仿射） → 工程 CRS（[`CrsTransform`]）→
+/// 屏幕（[`Projector`]）。UV 保持线性，因此每个小三角形内部仍是仿射贴图，
+/// 整个网格拼起来就得到投影后的梯形/弧形轮廓（QGIS 里影像「由矩形变梯形」的来源）。
+///
+/// 返回 `None` 表示有顶点落到无穷远，调用方应退回矩形贴图。
+fn warped_mesh(
+    meta: &DatasetSnapshot,
+    window: &PixelWindow,
+    projector: &Projector,
+    xf: &CrsTransform,
+    segments: usize,
+    texture: egui::TextureId,
+) -> Option<Mesh> {
+    // 窗口比分段数还小时不必再细分。
+    let seg_x = segments.min(window.width.max(1) as usize).max(1);
+    let seg_y = segments.min(window.height.max(1) as usize).max(1);
+    let mut mesh = Mesh::with_texture(texture);
+    mesh.reserve_vertices((seg_x + 1) * (seg_y + 1));
+    mesh.reserve_triangles(seg_x * seg_y * 2);
+    for j in 0..=seg_y {
+        let row = f64::from(window.y) + f64::from(window.height) * j as f64 / seg_y as f64;
+        let v = (row - f64::from(window.y)) / f64::from(window.height.max(1));
+        for i in 0..=seg_x {
+            let col = f64::from(window.x) + f64::from(window.width) * i as f64 / seg_x as f64;
+            let u = (col - f64::from(window.x)) / f64::from(window.width.max(1));
+            let world = pixel_to_world_f64(meta, col, row);
+            let world = xf.apply(world).unwrap_or(world);
+            let (sx, sy) = projector.project_xy(world[0], world[1]);
+            if !(sx.is_finite() && sy.is_finite()) {
+                return None;
+            }
+            mesh.vertices.push(Vertex {
+                pos: pos2(sx, sy),
+                uv: pos2(u as f32, v as f32),
+                color: Color32::WHITE,
+            });
+        }
+    }
+    let stride = (seg_x + 1) as u32;
+    for j in 0..seg_y as u32 {
+        for i in 0..seg_x as u32 {
+            let base = j * stride + i;
+            mesh.add_triangle(base, base + 1, base + stride);
+            mesh.add_triangle(base + 1, base + stride + 1, base + stride);
+        }
+    }
+    Some(mesh)
 }
 
 /// 取回后台线程的产出并转成贴图。
@@ -953,10 +1088,14 @@ fn tile_distance(tile: &PixelWindow, view: &PixelWindow) -> f64 {
 }
 
 /// 像素窗口四角投影后的屏幕矩形（包围盒）。
+///
+/// `xf` 非空时先做「图层 CRS → 工程 CRS」变换；包围盒用于密度估计与绘制排序，
+/// 精确的屏幕形状由 [`RasterPainter::draw_texture`] 的网格决定。
 fn pixel_window_screen_rect(
     meta: &DatasetSnapshot,
     window: &PixelWindow,
     projector: &Projector,
+    xf: Option<&CrsTransform>,
 ) -> Option<Rect> {
     let corners = [
         (window.x, window.y),
@@ -968,6 +1107,10 @@ fn pixel_window_screen_rect(
     let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for (col, row) in corners {
         let world = pixel_to_world(meta, col, row);
+        let world = match xf {
+            Some(xf) => xf.apply(world).unwrap_or(world),
+            None => world,
+        };
         let (sx, sy) = projector.project_xy(world[0], world[1]);
         if !(sx.is_finite() && sy.is_finite()) {
             return None;
@@ -1036,9 +1179,14 @@ fn world_to_pixel_coords(
 }
 
 fn pixel_to_world(meta: &DatasetSnapshot, col: u32, row: u32) -> [f64; 2] {
+    pixel_to_world_f64(meta, f64::from(col), f64::from(row))
+}
+
+/// 亚像素版本：重投影网格的顶点落在块内部，不在整数像素上。
+fn pixel_to_world_f64(meta: &DatasetSnapshot, col: f64, row: f64) -> [f64; 2] {
     meta.georeference
-        .pixel_to_world(f64::from(col), f64::from(row))
-        .unwrap_or([f64::from(col), f64::from(meta.height) - f64::from(row)])
+        .pixel_to_world(col, row)
+        .unwrap_or([col, f64::from(meta.height) - row])
 }
 
 /// 显示设置解析出的三个通道波段，以及可选的 Alpha 波段。
@@ -1693,7 +1841,7 @@ mod tests {
     ) {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             let egui_painter = ctx.layer_painter(egui::LayerId::background());
-            painter.paint(ctx, &egui_painter, rect, view, &[layer]);
+            painter.paint(ctx, &egui_painter, rect, view, &[layer], None);
         });
     }
 
@@ -1773,5 +1921,166 @@ mod tests {
         assert_eq!(image.size, [16, 16]);
         assert!(image.pixels.iter().any(|pixel| pixel.a() < 255));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // 真实样例：跨 CRS 的重叠（用户报的问题）
+    // -----------------------------------------------------------------------
+
+    /// EPSG:32632 的 S2 影像 + WGS84 的矢量，投到 WGS84 工程里必须落在同一处。
+    ///
+    /// 依赖本机 `E:\System\Documents\temp` 下的样例（不在仓库里），缺文件时直接跳过，
+    /// 需要时手动跑：`cargo test utm_raster_lands_on_wgs84_vector -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "依赖本机 E:\\System\\Documents\\temp 的真实样例数据"]
+    fn utm_raster_lands_on_wgs84_vector() {
+        use crate::geo::{CrsId, ProjectionModel};
+
+        let tif = std::path::Path::new(r"E:\System\Documents\temp\S2A_T32TQR_20261016_RGB_10m.tif");
+        let shp = std::path::Path::new(r"E:\System\Documents\temp\area2.shp");
+        if !tif.exists() || !shp.exists() {
+            eprintln!("跳过：样例数据不存在");
+            return;
+        }
+        let raster = RasterLayer::open(tif, "s2".to_owned()).unwrap();
+        println!(
+            "影像源 CRS: {:?}  范围 {:?}",
+            raster.projection, raster.bounds
+        );
+        assert!(
+            matches!(raster.projection.crs, CrsId::Epsg(32632)),
+            "影像应被识别成 EPSG:32632，实际 {:?}",
+            raster.projection
+        );
+
+        let vector = crate::geo::load_file(shp).unwrap();
+        println!(
+            "矢量源 CRS: {:?}  范围 {:?}",
+            vector.projection, vector.bounds
+        );
+        assert_eq!(vector.projection.model, ProjectionModel::Geographic);
+
+        let wgs84 = ProjectionInfo {
+            model: ProjectionModel::Geographic,
+            crs: CrsId::Epsg(4326),
+        };
+        let raster_shown =
+            crate::geo::proj::display_aabb(raster.bounds, &raster.projection, &wgs84);
+        println!("影像在 WGS84 下: {raster_shown:?}");
+        // 实测：32 带、假东约 700–810 km（中央经线 9°E 以东），纬度带 T
+        // ⇒ 约 11.5°E–13.0°E / 45.0°N–46.0°N。
+        assert!(
+            raster_shown.min[0] > 11.0 && raster_shown.max[0] < 13.5,
+            "经度不合理：{raster_shown:?}"
+        );
+        assert!(
+            raster_shown.min[1] > 44.5 && raster_shown.max[1] < 46.5,
+            "纬度不合理：{raster_shown:?}"
+        );
+        assert!(
+            raster_shown.intersects(&vector.bounds),
+            "重投影后影像与矢量应当重叠：影像 {raster_shown:?} / 矢量 {:?}",
+            vector.bounds
+        );
+        // 反过来也要成立（`display_aabb` 是双向可用的）。
+        let vector_shown =
+            crate::geo::proj::display_aabb(vector.bounds, &vector.projection, &wgs84);
+        assert_eq!(vector_shown, vector.bounds, "同源应恒等");
+    }
+
+    /// 跨 CRS 的贴图必须是「网格 + 逐顶点变换」：矩形贴图（`painter.image`）的四角
+    /// 永远构成平行四边形，而 UTM 影像落进经纬度工程后应当是梯形。
+    ///
+    /// 这里直接检查网格角点的几何，不依赖窗口/GPU。
+    #[test]
+    fn warped_mesh_bends_utm_texture_into_a_trapezoid() {
+        use crate::geo::proj::CrsTransform;
+        use crate::geo::{CrsId, ProjectionInfo, ProjectionModel};
+        use crate::map::{MapView, Projector};
+        use crate::raster::Affine;
+
+        let path = crate::raster::fixture_tests::sample_geotiff("paint-warp");
+        let dataset = RasterDataset::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let utm = ProjectionInfo {
+            model: ProjectionModel::Projected,
+            crs: CrsId::Epsg(32632),
+        };
+        let wgs84 = ProjectionInfo {
+            model: ProjectionModel::Geographic,
+            crs: CrsId::Epsg(4326),
+        };
+        // 与 S2 影像同量级：10 m 分辨率、约 110 km 见方，位于 32 带中央经线以东。
+        let affine = Affine {
+            a: 10.0,
+            b: 0.0,
+            c: 700_000.0,
+            d: 0.0,
+            e: -10.0,
+            f: 5_100_000.0,
+        };
+        let meta = DatasetSnapshot {
+            width: 10_980,
+            height: 10_980,
+            georeference: GeoReference {
+                transform: Some(affine),
+                crs: utm.clone(),
+                warnings: Vec::new(),
+                gcp_count: 0,
+            },
+            ..DatasetSnapshot::capture(&dataset)
+        };
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(1200.0, 900.0));
+        let window = full_window(&meta);
+
+        // 控制组：同源（恒等变换）时网格仍是完美的矩形（平行四边形缺陷 ≈ 0）。
+        let identity = CrsTransform::between(&utm, &utm).unwrap();
+        let view = MapView::fit(Some(affine.bounds(meta.width, meta.height)), rect);
+        let projector = Projector::new(rect, &view);
+        let flat = warped_mesh(
+            &meta,
+            &window,
+            &projector,
+            &identity,
+            2,
+            egui::TextureId::default(),
+        )
+        .unwrap();
+        let defect = |m: &Mesh| {
+            let corner = |i: usize| m.vertices[i].pos.to_vec2();
+            ((corner(0) + corner(8)) - (corner(2) + corner(6))).length()
+        };
+        assert!(defect(&flat) < 0.05, "恒等变换不该变形：{}", defect(&flat));
+
+        // 跨 CRS：四角围成梯形，平行四边形缺陷是像素级的。
+        let xf = CrsTransform::between(&utm, &wgs84).unwrap();
+        let shown = xf.apply_aabb(affine.bounds(meta.width, meta.height));
+        let view = MapView::fit(Some(shown), rect);
+        let projector = Projector::new(rect, &view);
+        let warped = warped_mesh(
+            &meta,
+            &window,
+            &projector,
+            &xf,
+            2,
+            egui::TextureId::default(),
+        )
+        .unwrap();
+        assert_eq!(warped.vertices.len(), 9, "2×2 分段应有 9 个顶点");
+        assert_eq!(warped.indices.len(), 8 * 3, "2×2 分段应有 8 个三角形");
+        assert!(
+            defect(&warped) > 0.5,
+            "重投影后轮廓应变成梯形，实际几乎仍是矩形（缺陷 {}）",
+            defect(&warped)
+        );
+
+        // 角点来自「像素 → 源世界 → 工程世界 → 屏幕」，UV 仍是 0..1。
+        let nw_world = xf.apply(affine.apply(0.0, 0.0)).unwrap();
+        let (sx, sy) = projector.project_xy(nw_world[0], nw_world[1]);
+        let nw = warped.vertices[0];
+        assert!((nw.pos.x - sx).abs() < 0.01 && (nw.pos.y - sy).abs() < 0.01);
+        assert_eq!(nw.uv, pos2(0.0, 0.0));
+        assert_eq!(warped.vertices[8].uv, pos2(1.0, 1.0));
     }
 }

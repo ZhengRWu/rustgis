@@ -32,7 +32,11 @@ impl RustGisApp {
 
         let just_fit = self.needs_fit || self.map.view.is_none();
         if just_fit {
-            self.map.view = Some(map::MapView::fit(self.layers.total_bounds(), rect));
+            self.map.view = Some(map::MapView::fit(
+                self.layers
+                    .total_bounds_for(self.project_projection.as_ref()),
+                rect,
+            ));
             self.needs_fit = false;
         }
         // 右键「缩放至图层 / 缩放至组」：范围由菜单回调算出，这里用本帧地图控件的
@@ -78,7 +82,11 @@ impl RustGisApp {
 
         // 双击缩放至全图
         if response.double_clicked() {
-            view = map::MapView::fit(self.layers.total_bounds(), rect);
+            view = map::MapView::fit(
+                self.layers
+                    .total_bounds_for(self.project_projection.as_ref()),
+                rect,
+            );
             self.map.view = Some(view);
             self.dirty = true;
         }
@@ -107,12 +115,23 @@ impl RustGisApp {
             let rasters: Vec<&crate::raster::RasterLayer> =
                 self.layers.iter_visible_rasters().collect();
             if !rasters.is_empty() {
-                self.raster_painter
-                    .paint(ui.ctx(), &painter, rect, &view, &rasters);
+                self.raster_painter.paint(
+                    ui.ctx(),
+                    &painter,
+                    rect,
+                    &view,
+                    &rasters,
+                    self.project_projection.as_ref(),
+                );
             }
             // 缓存渲染：视图 / 画布 / 图层都没变时直接复用上一帧的形状。
-            self.map_renderer
-                .render(&painter, rect, &self.layers, &view);
+            self.map_renderer.render(
+                &painter,
+                rect,
+                &self.layers,
+                &view,
+                self.project_projection.as_ref(),
+            );
         }
 
         // 拖放提示：文件悬停在窗口上（尚未松开）时铺一层淡色 + 虚线框，

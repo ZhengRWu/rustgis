@@ -26,6 +26,7 @@
 
 use egui::{Pos2, Rect};
 
+use crate::geo::proj::CrsTransform;
 use crate::map::{MapView, Projector};
 
 /// 相邻屏幕点距离小于该值（像素）即视为重复顶点。
@@ -61,7 +62,7 @@ const DEFAULT_CULL_PAD_PX: f32 = 4.0;
 pub fn stroke_path(world: &[[f64; 2]], rect: Rect, view: &MapView, closed: bool) -> Vec<Pos2> {
     let proj = Projector::new(rect, view);
     let mut out = Vec::new();
-    stroke_path_into(world, &proj, closed, DEFAULT_CULL_PAD_PX, &mut out);
+    stroke_path_into(world, &proj, None, closed, DEFAULT_CULL_PAD_PX, &mut out);
     out
 }
 
@@ -74,6 +75,7 @@ pub fn stroke_path(world: &[[f64; 2]], rect: Rect, view: &MapView, closed: bool)
 pub fn stroke_path_into(
     world: &[[f64; 2]],
     proj: &Projector,
+    xf: Option<&CrsTransform>,
     closed: bool,
     pad_px: f32,
     out: &mut Vec<Pos2>,
@@ -87,7 +89,13 @@ pub fn stroke_path_into(
     let mut x1 = f32::NEG_INFINITY;
     let mut y1 = f32::NEG_INFINITY;
     for w in world {
-        let (x, y) = proj.project_xy(w[0], w[1]);
+        // 先做「源 CRS → 工程 CRS」变换（不重投影时 `xf == None`）；
+        // 变换失败（如超出投影有效范围）退回源坐标，保证几何不丢。
+        let p = match xf {
+            Some(xf) => xf.apply(*w).unwrap_or(*w),
+            None => *w,
+        };
+        let (x, y) = proj.project_xy(p[0], p[1]);
         // 非有限坐标（NaN / inf）无法参与几何运算，直接丢弃。
         if !x.is_finite() || !y.is_finite() {
             continue;
@@ -455,17 +463,17 @@ mod tests {
         let mut out = Vec::new();
 
         let far = world(&[(900.0, 0.0), (950.0, 10.0), (990.0, -10.0)]);
-        stroke_path_into(&far, &proj, false, DEFAULT_CULL_PAD_PX, &mut out);
+        stroke_path_into(&far, &proj, None, false, DEFAULT_CULL_PAD_PX, &mut out);
         assert!(out.is_empty(), "视口外的路径未被剔除");
 
         // 跨越视口边缘：只按包围盒判定，保留后再交给后面的清理流程
         let crossing = world(&[(0.0, 0.0), (900.0, 0.0)]);
-        stroke_path_into(&crossing, &proj, false, DEFAULT_CULL_PAD_PX, &mut out);
+        stroke_path_into(&crossing, &proj, None, false, DEFAULT_CULL_PAD_PX, &mut out);
         assert_eq!(out.len(), 2);
 
         // 贴在右边界外 3px：仍在 4px 留白内，必须保留（否则贴着视口边的线会闪断）
         let touching = world(&[(503.0, 0.0), (520.0, 0.0)]);
-        stroke_path_into(&touching, &proj, false, DEFAULT_CULL_PAD_PX, &mut out);
+        stroke_path_into(&touching, &proj, None, false, DEFAULT_CULL_PAD_PX, &mut out);
         assert_eq!(out.len(), 2);
 
         // 与 `stroke_path` 简单入口的结论必须一致

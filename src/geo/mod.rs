@@ -13,6 +13,10 @@ pub mod buffer;
 
 pub mod overlay;
 
+pub mod proj;
+
+use proj::display_aabb;
+
 use std::path::Path;
 
 use egui::Color32;
@@ -730,6 +734,25 @@ impl LayerNode {
         union
     }
 
+    /// 节点自身（组则为整个子树）在**工程 CRS** 下的包围盒。
+    ///
+    /// 图层几何保存在源 CRS 里，[`Self::bounds`] 得到的也是源 CRS 的盒；视图适配、
+    /// 缩放至图层必须用投影后的盒，否则 WGS 84 工程里的 UTM 影像会算出几十万度的跨度。
+    /// 无法识别任一 CRS 时退回源盒（即不重投影）。
+    pub fn bounds_in(&self, project: &ProjectionInfo) -> Aabb {
+        let mut union = Aabb::empty();
+        match self {
+            Self::Layer(l) => union.merge(display_aabb(l.bounds, &l.projection, project)),
+            Self::Raster(r) => union.merge(display_aabb(r.bounds, &r.projection, project)),
+            Self::Group(g) => {
+                for child in &g.children {
+                    union.merge(child.bounds_in(project));
+                }
+            }
+        }
+        union
+    }
+
     /// 子树中是否含有至少一个叶子图层（空组不算）。
     fn has_layers(&self) -> bool {
         match self {
@@ -992,6 +1015,29 @@ impl LayerManager {
             union.merge(raster.bounds);
         }
         if union.is_empty() { None } else { Some(union) }
+    }
+
+    /// 全部有效可见层级在**工程 CRS** 下的联合包围盒（矢量 + 栅格）。
+    ///
+    /// 语义同 [`Self::total_bounds`]，但每个图层先重投影到 `project`。
+    pub fn total_bounds_in(&self, project: &ProjectionInfo) -> Option<Aabb> {
+        let mut union = Aabb::empty();
+        for layer in self.iter_visible() {
+            union.merge(display_aabb(layer.bounds, &layer.projection, project));
+        }
+        for raster in self.iter_visible_rasters() {
+            union.merge(display_aabb(raster.bounds, &raster.projection, project));
+        }
+        if union.is_empty() { None } else { Some(union) }
+    }
+
+    /// [`Self::total_bounds`] / [`Self::total_bounds_in`] 的统一入口：
+    /// 工程坐标系未设置（`None`）时不做重投影。
+    pub fn total_bounds_for(&self, project: Option<&ProjectionInfo>) -> Option<Aabb> {
+        match project {
+            Some(project) => self.total_bounds_in(project),
+            None => self.total_bounds(),
+        }
     }
 }
 
@@ -2342,5 +2388,95 @@ mod tests {
         let info = parse_prj_wkt("garbage data");
         assert_eq!(info.model, ProjectionModel::Unknown);
         assert_eq!(info.crs, CrsId::None);
+    }
+
+    // -----------------------------------------------------------------------
+    // 按需重投影：显示包围盒
+    // -----------------------------------------------------------------------
+
+    /// WGS84 工程里的 EPSG:32632 图层：显示包围盒必须换算成经纬度，
+    /// 否则「适配全图 / 缩放至图层」会得到一个以米为单位的巨大范围。
+    #[test]
+    fn bounds_in_reprojects_utm_layer_to_wgs84() {
+        let wgs84 = ProjectionInfo {
+            model: ProjectionModel::Geographic,
+            crs: CrsId::Epsg(4326),
+        };
+        let mut layer = boxed_layer("utm", 500_000.0);
+        layer.projection = ProjectionInfo {
+            model: ProjectionModel::Projected,
+            crs: CrsId::Epsg(32632),
+        };
+        let mut mgr = LayerManager::default();
+        let id = mgr.add(layer);
+
+        // 源 CRS 下原样返回。
+        let source = mgr.node(id).unwrap().bounds();
+        assert!((source.min[0] - 500_000.0).abs() < 1e-9);
+
+        // 32 带中央经线 9°E、赤道附近 ⇒ 经纬度约 (9, 0)。
+        let shown = mgr.node(id).unwrap().bounds_in(&wgs84);
+        assert!(
+            (shown.min[0] - 9.0).abs() < 1e-3,
+            "经度应约为 9°，实际 {shown:?}"
+        );
+        assert!(shown.min[1].abs() < 1e-3, "纬度应约为 0°，实际 {shown:?}");
+        assert!(shown.width() > 0.0 && shown.width() < 1e-3, "{shown:?}");
+    }
+
+    /// 混 CRS 的工程：全图范围在工程 CRS 下合并，而不是把米和度直接取并集。
+    #[test]
+    fn total_bounds_in_merges_layers_of_different_crs() {
+        let wgs84 = ProjectionInfo {
+            model: ProjectionModel::Geographic,
+            crs: CrsId::Epsg(4326),
+        };
+        let mut mgr = LayerManager::default();
+        let g = mgr.add_group("G".into());
+        // 经纬度图层：9°E 附近约 100 m 的小方块。
+        mgr.add(Layer::from_geometry(
+            "geo".to_string(),
+            Vec::new(),
+            Vec::new(),
+            vec![PolygonData {
+                outer: vec![
+                    [9.0, 0.0],
+                    [9.001, 0.0],
+                    [9.001, 0.001],
+                    [9.0, 0.001],
+                    [9.0, 0.0],
+                ],
+                holes: Vec::new(),
+            }],
+        ));
+        mgr.select(u64::MAX);
+        // UTM 图层：同一个地方（32 带假东 500 km，赤道）。
+        let mut utm = boxed_layer("utm", 500_000.0);
+        utm.projection = ProjectionInfo {
+            model: ProjectionModel::Projected,
+            crs: CrsId::Epsg(32632),
+        };
+        mgr.add(utm);
+        mgr.select(g);
+
+        let mixed = mgr.total_bounds().unwrap();
+        assert!(
+            mixed.width() > 100_000.0,
+            "源 CRS 直接合并会得到错误的巨大范围"
+        );
+
+        let shown = mgr.total_bounds_in(&wgs84).unwrap();
+        assert!(
+            shown.width() < 0.01 && shown.height() < 0.01,
+            "重投影后两个图层应重叠在 9°E 附近，实际 {shown:?}"
+        );
+        assert!((shown.min[0] - 9.0).abs() < 1e-3, "{shown:?}");
+
+        assert_eq!(
+            mgr.total_bounds_for(Some(&wgs84)),
+            Some(shown),
+            "total_bounds_for 是同一逻辑的统一入口"
+        );
+        assert_eq!(mgr.total_bounds_for(None), Some(mixed));
     }
 }

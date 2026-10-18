@@ -372,7 +372,14 @@ impl RustGisApp {
     /// 这里只排队、不立刻改视图：右键菜单位于内容列表面板内，拿不到地图控件的
     /// 精确像素矩形，下一帧由 `map_view::map_panel` 用实际矩形调用 `MapView::fit`。
     fn zoom_to_node(&mut self, id: u64) {
-        let Some(bounds) = self.layers.node(id).map(geo::LayerNode::bounds) else {
+        // 必须在**工程 CRS** 下取范围：源 CRS 是 UTM 的影像，其米制包围盒
+        // 放到经纬度工程里直接适配，跨度会变成几十万「度」。
+        let project = self.project_projection.clone();
+        let bounds = match &project {
+            Some(project) => self.layers.node(id).map(|n| n.bounds_in(project)),
+            None => self.layers.node(id).map(geo::LayerNode::bounds),
+        };
+        let Some(bounds) = bounds else {
             return;
         };
         if bounds.is_empty() {
@@ -498,11 +505,15 @@ impl RustGisApp {
         let id = row.id;
         // 与 QGIS 一致（`setEnabled(layer->isValid())`）：空组、无几何或无地理参考的
         // 图层没有有效范围，菜单项禁用而不是缩放到默认的全图范围。
-        let node_bounds = self
-            .layers
-            .node(id)
-            .map(geo::LayerNode::bounds)
-            .filter(|b| !b.is_empty());
+        let node_bounds = {
+            // 与缩放动作保持同一口径：工程坐标系已设置时按显示范围判断有效性。
+            let project = self.project_projection.clone();
+            match &project {
+                Some(project) => self.layers.node(id).map(|n| n.bounds_in(project)),
+                None => self.layers.node(id).map(geo::LayerNode::bounds),
+            }
+            .filter(|b| !b.is_empty())
+        };
         resp.context_menu(|ui| {
             let zoom_key = if is_group {
                 "layers.zoomToGroup"

@@ -24,7 +24,8 @@ use std::sync::Arc;
 use egui::epaint::{PathShape, Vertex, WHITE_UV};
 use egui::{Color32, Mesh, Painter, Pos2, Rect, Shape, Stroke};
 
-use crate::geo::{Aabb, Layer, LayerManager};
+use crate::geo::proj::CrsTransform;
+use crate::geo::{Aabb, Layer, LayerManager, ProjectionInfo};
 use crate::map::{MapView, Projector, simplify};
 
 /// 视口裁剪的像素余量：描边是骑在几何边界上的，抗锯齿羽化也会外溢一两个像素。
@@ -49,16 +50,18 @@ pub struct FrameStats {
 }
 
 /// 帧标识：只要它没变，上一帧的形状就依然成立。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FrameKey {
     center: [u64; 2],
     scale: u32,
     rect: [u32; 4],
     revision: u64,
+    /// 工程 CRS：改变工程坐标系必须重建（顶点是按旧目标 CRS 变换过的）。
+    project: Option<ProjectionInfo>,
 }
 
 impl FrameKey {
-    fn new(rect: Rect, view: &MapView, revision: u64) -> Self {
+    fn new(rect: Rect, view: &MapView, revision: u64, project: Option<&ProjectionInfo>) -> Self {
         Self {
             center: [view.center[0].to_bits(), view.center[1].to_bits()],
             scale: view.scale.to_bits(),
@@ -69,6 +72,7 @@ impl FrameKey {
                 rect.max.y.to_bits(),
             ],
             revision,
+            project: project.cloned(),
         }
     }
 }
@@ -89,17 +93,21 @@ pub struct Renderer {
 
 impl Renderer {
     /// 渲染所有可见图层到 `painter`（`rect` 为地图区域）。
+    ///
+    /// `project` 是工程 CRS：每个图层在绘制前把顶点从自己的源 CRS 变换到它。
+    /// `None` 表示不做重投影（老工程 / 未设置工程坐标系）。
     pub fn render(
         &mut self,
         painter: &Painter,
         rect: Rect,
         layers: &LayerManager,
         view: &MapView,
+        project: Option<&ProjectionInfo>,
     ) -> FrameStats {
-        let key = FrameKey::new(rect, view, layers.revision());
-        let rebuilt = self.key != Some(key);
+        let key = FrameKey::new(rect, view, layers.revision(), project);
+        let rebuilt = self.key.as_ref() != Some(&key);
         if rebuilt {
-            self.rebuild(rect, layers, view, key);
+            self.rebuild(rect, layers, view, project, key);
         }
         painter.extend(self.shapes.iter().cloned());
         self.stats(rebuilt)
@@ -151,7 +159,14 @@ impl Renderer {
         }
     }
 
-    fn rebuild(&mut self, rect: Rect, layers: &LayerManager, view: &MapView, key: FrameKey) {
+    fn rebuild(
+        &mut self,
+        rect: Rect,
+        layers: &LayerManager,
+        view: &MapView,
+        project: Option<&ProjectionInfo>,
+        key: FrameKey,
+    ) {
         // 先把上一帧的网格归还池子，再清空形状列表。
         for shape in std::mem::take(&mut self.shapes) {
             if let Shape::Mesh(mesh) = shape {
@@ -170,33 +185,49 @@ impl Renderer {
             if layer.bounds.is_empty() {
                 continue;
             }
-            // ① 图层级裁剪：整个图层在视口之外时一个顶点都不碰。
-            if !layer.bounds.intersects(&visible) {
+            // 图层 CRS → 工程 CRS；同源或无法识别时为恒等（源坐标直接用）。
+            let xf = project
+                .and_then(|p| CrsTransform::between(&layer.projection, p))
+                .filter(|xf| !xf.is_identity());
+            // 图层级裁剪必须用**工程 CRS** 下的显示范围：逐顶点变换太贵。
+            let shown_bounds = match &xf {
+                Some(xf) => xf.apply_aabb(layer.bounds),
+                None => layer.bounds,
+            };
+            // ① 整个图层在视口之外时一个顶点都不碰。
+            if !shown_bounds.intersects(&visible) {
                 continue;
             }
-            // ② 图层整体落在视口内时，逐要素 / 逐三角形的测试都可以省掉。
-            let fully_visible = visible.contains_aabb(&layer.bounds);
-            self.render_layer(&proj, &visible, fully_visible, layer);
+            // 逐要素 / 逐三角形的测试仍在**源 CRS** 里做，因此把视口反算回去。
+            let source_visible = match &xf {
+                Some(xf) => xf.unapply_aabb(visible),
+                None => visible,
+            };
+            // ② 图层整体落在视口内时，逐要素的测试都可以省掉。
+            let fully_visible = source_visible.contains_aabb(&layer.bounds);
+            self.render_layer(&proj, xf.as_ref(), &source_visible, fully_visible, layer);
         }
     }
 
     fn render_layer(
         &mut self,
         proj: &Projector,
+        xf: Option<&CrsTransform>,
         visible: &Aabb,
         fully_visible: bool,
         layer: &Layer,
     ) {
         let style = layer.style;
-        self.render_fill(proj, visible, fully_visible, layer);
-        self.render_strokes(proj, layer, style.outline_width);
-        self.render_points(proj, visible, fully_visible, layer);
+        self.render_fill(proj, xf, visible, fully_visible, layer);
+        self.render_strokes(proj, xf, layer, style.outline_width);
+        self.render_points(proj, xf, visible, fully_visible, layer);
     }
 
     /// 多边形填充：导入时缓存的三角剖分 → 一个 `Mesh`。
     fn render_fill(
         &mut self,
         proj: &Projector,
+        xf: Option<&CrsTransform>,
         visible: &Aabb,
         fully_visible: bool,
         layer: &Layer,
@@ -213,9 +244,9 @@ impl Renderer {
                 continue;
             }
             let base = mesh.vertices.len() as u32;
-            let (x0, y0) = proj.project_xy(t[0], t[1]);
-            let (x1, y1) = proj.project_xy(t[2], t[3]);
-            let (x2, y2) = proj.project_xy(t[4], t[5]);
+            let (x0, y0) = project_world(proj, xf, t[0], t[1]);
+            let (x1, y1) = project_world(proj, xf, t[2], t[3]);
+            let (x2, y2) = project_world(proj, xf, t[4], t[5]);
             mesh.vertices.push(vtx(Pos2::new(x0, y0), fill));
             mesh.vertices.push(vtx(Pos2::new(x1, y1), fill));
             mesh.vertices.push(vtx(Pos2::new(x2, y2), fill));
@@ -225,11 +256,17 @@ impl Renderer {
     }
 
     /// 描边：外环（闭合）、孔（闭合）、线（开放）。
-    fn render_strokes(&mut self, proj: &Projector, layer: &Layer, width: f32) {
+    fn render_strokes(
+        &mut self,
+        proj: &Projector,
+        xf: Option<&CrsTransform>,
+        layer: &Layer,
+        width: f32,
+    ) {
         let stroke = Stroke::new(width, layer.style.outline);
         let pad = CULL_PAD_PX + width * 0.5;
         for ring in layer.outer_rings.iter().chain(&layer.hole_rings) {
-            simplify::stroke_path_into(ring, proj, true, pad, &mut self.stroke_pts);
+            simplify::stroke_path_into(ring, proj, xf, true, pad, &mut self.stroke_pts);
             if self.stroke_pts.len() >= 2 {
                 self.shapes.push(Shape::Path(PathShape::closed_line(
                     self.stroke_pts.clone(),
@@ -238,7 +275,7 @@ impl Renderer {
             }
         }
         for line in &layer.lines {
-            simplify::stroke_path_into(line, proj, false, pad, &mut self.stroke_pts);
+            simplify::stroke_path_into(line, proj, xf, false, pad, &mut self.stroke_pts);
             if self.stroke_pts.len() >= 2 {
                 self.shapes.push(Shape::Path(PathShape::line(
                     self.stroke_pts.clone(),
@@ -252,6 +289,7 @@ impl Renderer {
     fn render_points(
         &mut self,
         proj: &Projector,
+        xf: Option<&CrsTransform>,
         visible: &Aabb,
         fully_visible: bool,
         layer: &Layer,
@@ -274,7 +312,7 @@ impl Renderer {
             if !fully_visible && !visible.contains_point(*p) {
                 continue;
             }
-            let (cx, cy) = proj.project_xy(p[0], p[1]);
+            let (cx, cy) = project_world(proj, xf, p[0], p[1]);
             let base = mesh.vertices.len() as u32;
             mesh.vertices.push(vtx(Pos2::new(cx, cy), color));
             for (dx, dy) in rim {
@@ -297,7 +335,19 @@ impl Renderer {
 #[cfg(test)]
 pub fn render_layers(painter: &Painter, rect: Rect, layers: &LayerManager, view: &MapView) {
     let mut renderer = Renderer::default();
-    renderer.render(painter, rect, layers, view);
+    renderer.render(painter, rect, layers, view, None);
+}
+
+/// 源 CRS 的世界坐标 → 目标 CRS（`xf == None` 时原样）→ 屏幕坐标。
+///
+/// 变换失败（超出投影有效范围）时退回源坐标：宁可在屏幕上偏一点，也不让几何消失。
+#[inline]
+fn project_world(proj: &Projector, xf: Option<&CrsTransform>, x: f64, y: f64) -> (f32, f32) {
+    let p = match xf {
+        Some(xf) => xf.apply([x, y]).unwrap_or([x, y]),
+        None => [x, y],
+    };
+    proj.project_xy(p[0], p[1])
 }
 
 #[inline(always)]
@@ -505,7 +555,7 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let painter = ui.painter_at(rect);
                 let t = std::time::Instant::now();
-                let s = renderer.render(&painter, rect, manager, view);
+                let s = renderer.render(&painter, rect, manager, view, None);
                 build_ms.set(t.elapsed().as_secs_f64() * 1e3);
                 stats.set(s);
             });
@@ -663,7 +713,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut stats = FrameStats::default();
         collect_shapes(rect, |painter| {
-            stats = renderer.render(painter, rect, &manager, &view);
+            stats = renderer.render(painter, rect, &manager, &view, None);
         });
         assert_eq!(stats.shapes, 0);
         assert_eq!(stats.vertices, 0);
@@ -691,7 +741,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut stats = FrameStats::default();
         let shapes = collect_shapes(rect, |painter| {
-            stats = renderer.render(painter, rect, &manager, &view);
+            stats = renderer.render(painter, rect, &manager, &view, None);
         });
         // 这个图层有两个外环：近的在视口内、远的在外。视口外的环既不该进填充网格，
         // 也不该产生描边路径，因此形状恰好是「1 个填充网格 + 1 条外环描边」。
@@ -719,7 +769,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut stats = FrameStats::default();
         collect_shapes(rect, |painter| {
-            stats = renderer.render(painter, rect, &manager, &view);
+            stats = renderer.render(painter, rect, &manager, &view, None);
         });
         assert_eq!(stats.shapes, 1, "点要素应合并成一个网格");
         assert_eq!(stats.vertices, 2 * (POINT_SEGMENTS + 1));
@@ -739,13 +789,13 @@ mod tests {
         let mut stats = FrameStats::default();
 
         let first = collect_shapes(rect, |painter| {
-            stats = renderer.render(painter, rect, &manager, &view);
+            stats = renderer.render(painter, rect, &manager, &view, None);
         });
         assert!(stats.rebuilt, "首帧必须构建");
         let first_paths: Vec<&Vec<Pos2>> = first.iter().filter_map(path_points).collect();
 
         let second = collect_shapes(rect, |painter| {
-            stats = renderer.render(painter, rect, &manager, &view);
+            stats = renderer.render(painter, rect, &manager, &view, None);
         });
         assert!(!stats.rebuilt, "视图未变却重建了缓存");
         let second_paths: Vec<&Vec<Pos2>> = second.iter().filter_map(path_points).collect();
@@ -755,14 +805,14 @@ mod tests {
         let mut pan = view;
         pan.center[0] += 1.0;
         collect_shapes(rect, |painter| {
-            stats = renderer.render(painter, rect, &manager, &pan);
+            stats = renderer.render(painter, rect, &manager, &pan, None);
         });
         assert!(stats.rebuilt, "视图变化后必须重建");
 
         // 图层变化（这里用可见性 + 版本号）
         manager.set_visible(0, false);
         collect_shapes(rect, |painter| {
-            stats = renderer.render(painter, rect, &manager, &view);
+            stats = renderer.render(painter, rect, &manager, &view, None);
         });
         assert!(stats.rebuilt, "图层版本变化后必须重建");
         assert_eq!(stats.shapes, 0, "隐藏的图层不应再提交任何形状");
@@ -788,19 +838,85 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut stats = FrameStats::default();
         collect_shapes(rect, |painter| {
-            stats = renderer.render(painter, rect, &manager, &view);
+            stats = renderer.render(painter, rect, &manager, &view, None);
         });
         let mut full = Renderer::default();
         let mut full_stats = FrameStats::default();
         view.scale /= 8.0;
         collect_shapes(rect, |painter| {
-            full_stats = full.render(painter, rect, &manager, &view);
+            full_stats = full.render(painter, rect, &manager, &view, None);
         });
         assert!(
             stats.shapes * 4 < full_stats.shapes,
             "放大 8 倍后仍然画了 {}/{} 条路径，视口裁剪没生效",
             stats.shapes,
             full_stats.shapes
+        );
+    }
+
+    /// 绘制期重投影：WGS 84 工程里的 UTM 图层，顶点必须先按「源 CRS → 工程 CRS」
+    /// 变换再投影到屏幕，否则米制坐标会被当成经纬度画到天文数字的位置。
+    #[test]
+    fn vector_vertices_are_reprojected_into_project_crs() {
+        use crate::geo::proj::CrsTransform;
+        use crate::geo::{CrsId, ProjectionInfo, ProjectionModel};
+
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let utm = ProjectionInfo {
+            model: ProjectionModel::Projected,
+            crs: CrsId::Epsg(32632),
+        };
+        let wgs84 = ProjectionInfo {
+            model: ProjectionModel::Geographic,
+            crs: CrsId::Epsg(4326),
+        };
+        let mut manager = LayerManager::default();
+        manager.add(Layer {
+            id: 0,
+            name: "utm-point".into(),
+            visible: true,
+            style: LayerStyle::default(),
+            points: vec![[509_000.0, 5_000_000.0]],
+            bounds: Aabb {
+                min: [508_500.0, 4_999_500.0],
+                max: [509_500.0, 5_000_500.0],
+            },
+            feature_count: 1,
+            projection: utm.clone(),
+            ..Layer::default()
+        });
+
+        let xf = CrsTransform::between(&utm, &wgs84).unwrap();
+        let shown = xf.apply_aabb(manager.total_bounds().unwrap());
+        let view = MapView::fit(Some(shown), rect);
+        let projector = Projector::new(rect, &view);
+
+        let mut renderer = Renderer::default();
+        let mut stats = FrameStats::default();
+        collect_shapes(rect, |painter| {
+            stats = renderer.render(painter, rect, &manager, &view, Some(&wgs84));
+        });
+        assert_eq!(stats.vertices, POINT_SEGMENTS + 1, "点应画成一个网格");
+
+        let expected = xf.apply([509_000.0, 5_000_000.0]).unwrap();
+        let (ex, ey) = projector.project_xy(expected[0], expected[1]);
+        let reprojected = renderer
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                Shape::Mesh(mesh) => Some(&mesh.vertices),
+                _ => None,
+            })
+            .flatten()
+            .any(|v| (v.pos.x - ex).abs() < 0.01 && (v.pos.y - ey).abs() < 0.01);
+        assert!(reprojected, "顶点应落在工程 CRS 投影后的屏幕位置");
+        assert!(rect.contains(pos2(ex, ey)));
+
+        // 同一视图下若不做变换，源坐标（米）会落到屏幕外很远。
+        let (bx, by) = projector.project_xy(509_000.0, 5_000_000.0);
+        assert!(
+            (bx - ex).abs() > 1.0 || (by - ey).abs() > 1.0,
+            "不做变换时屏幕坐标应当明显不同（{bx},{by} vs {ex},{ey}）"
         );
     }
 
