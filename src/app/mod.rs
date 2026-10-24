@@ -19,6 +19,7 @@
 pub mod attr_table;
 pub mod buffer_dialog;
 pub mod geoprocess_dialog;
+pub mod identify;
 pub mod import;
 pub mod layers_panel;
 pub mod map_view;
@@ -26,8 +27,9 @@ pub mod project_op;
 pub mod raster_dialog;
 pub mod raster_op;
 pub mod toast;
-pub mod widgets;
 mod toolbar;
+mod toolbox;
+pub mod widgets;
 
 use std::path::PathBuf;
 
@@ -104,6 +106,8 @@ pub struct RustGisApp {
     layers: LayerManager,
     /// 地图视图状态。
     map: MapState,
+    /// 「识别」工具的结果窗口（单击地图后显示最顶层要素 / 像元信息）。
+    identify: identify::IdentifyState,
     /// 跨帧复用的地图渲染器（视图不变时直接复用上一帧的形状）。
     map_renderer: map::render::Renderer,
     /// 后台导入流水线（等待文件选择 / 等待解析完成）。
@@ -116,6 +120,9 @@ pub struct RustGisApp {
     geo_dialog: Option<GeoWindow>,
     /// 后台地理处理流水线（确定之后、结果加入图层之前）。
     geo_job: Option<GeoJob>,
+    toolbox: toolbox::Toolbox,
+    mask_dialog: toolbox::MaskDialog,
+    mask_job: Option<toolbox::MaskJob>,
     /// 上一帧中央地图区域（缓冲结果落点判断用：视图是否已包含结果范围）。
     map_rect: Option<egui::Rect>,
     /// 下一帧将视图适配到全部数据范围。
@@ -204,12 +211,16 @@ impl RustGisApp {
             font_info,
             layers: LayerManager::default(),
             map: MapState::default(),
+            identify: identify::IdentifyState::default(),
             map_renderer: map::render::Renderer::default(),
             import: None,
             buffer_dialog: None,
             buffer_job: None,
             geo_dialog: None,
             geo_job: None,
+            toolbox: toolbox::Toolbox::default(),
+            mask_dialog: toolbox::MaskDialog::default(),
+            mask_job: None,
             map_rect: None,
             needs_fit: false,
             zoom_extent: None,
@@ -321,6 +332,14 @@ impl RustGisApp {
     /// 菜单项被点击时的统一入口（`key` 为 i18n key）。
     pub fn on_menu_item(&mut self, key: &str) -> MenuAction {
         match key {
+            "toolbox.open" => {
+                self.toolbox.open = true;
+                MenuAction::None
+            }
+            "raster.extractMask" => {
+                self.mask_dialog.open = true;
+                MenuAction::None
+            }
             // ── 文件：工程生命周期（对标 ArcGIS 文件菜单） ──
             "file.new" => {
                 self.start_new();
@@ -415,6 +434,7 @@ impl eframe::App for RustGisApp {
         self.poll_buffer_job(ctx);
         // 后台地理处理流水线推进（裁剪 / 相交 / 联合 / 合并 / 融合）
         self.poll_geo_job(ctx);
+        self.poll_mask_job(ctx);
         // 后台栅格流水线推进（导入 / 统计 / 金字塔构建，不阻塞主线程）
         self.poll_raster_stage(ctx);
         self.poll_raster_job(ctx);
@@ -458,8 +478,11 @@ impl eframe::App for RustGisApp {
             });
 
         TopBottomPanel::top("classic_toolbars")
-            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(245, 245, 245))
-                .inner_margin(egui::Margin::symmetric(4, 1)))
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(245, 245, 245))
+                    .inner_margin(egui::Margin::symmetric(4, 1)),
+            )
             .show(ctx, |ui| self.show_toolbars(ui));
 
         // 左侧图层管理面板（对标 ArcGIS 图层窗口位置）
@@ -520,6 +543,9 @@ impl eframe::App for RustGisApp {
         // 中央地图视图
         CentralPanel::default().show(ctx, |ui| self.map_panel(ui));
 
+        // 「识别结果」浮窗：地图点击后显示最顶层要素 / 像元信息。
+        self.show_identify_window(ctx);
+
         // 右下角通知：压在地图之上、模态对话框之下，不遮挡需要确认的窗口；
         // 底部按状态栏实际高度抬起，不盖住坐标 / 比例尺。
         self.toasts.show(ctx, status_bar.response.rect.height());
@@ -532,6 +558,8 @@ impl eframe::App for RustGisApp {
 
         // 「地理处理」对话框（裁剪 / 相交 / 联合 / 合并 / 融合，同一个窗口）。
         self.show_geoprocess_dialog(ctx);
+        self.show_toolbox(ctx);
+        self.show_mask_dialog(ctx);
 
         // 「是否构建金字塔」提示 + 栅格图层属性对话框。
         self.show_pyramid_prompt(ctx);

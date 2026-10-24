@@ -65,7 +65,7 @@ impl RustGisApp {
         }
 
         let mut zoom_box = None;
-        if self.map.tool != map::Tool::Pan {
+        if matches!(self.map.tool, map::Tool::ZoomIn | map::Tool::ZoomOut) {
             if response.hovered() || response.dragged() {
                 ui.ctx().set_cursor_icon(match self.map.tool {
                     map::Tool::ZoomIn => egui::CursorIcon::ZoomIn,
@@ -98,7 +98,20 @@ impl RustGisApp {
                 }
             }
         } else {
+            // 平移 / 识别工具不做框选缩放。
             self.map.zoom_drag_start = None;
+            if self.map.tool == map::Tool::Info && (response.hovered() || response.dragged()) {
+                // egui 没有「信息」光标，Help（问号）是语义最接近的一个。
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Help);
+            }
+        }
+
+        // 识别工具：单击地图 → 查询最顶层可视要素 / 像元（只读，不移动视图）。
+        if self.map.tool == map::Tool::Info
+            && response.clicked_by(egui::PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            self.identify_at(pos, rect, &view);
         }
 
         // 滚轮缩放（以光标为中心）。

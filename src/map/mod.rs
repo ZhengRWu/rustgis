@@ -22,6 +22,8 @@ pub enum Tool {
     Pan,
     ZoomIn,
     ZoomOut,
+    /// 识别：单击地图查询最顶层可视要素 / 像元信息（不改变视图）。
+    Info,
 }
 
 /// 地图交互总状态。

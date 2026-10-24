@@ -73,7 +73,7 @@ impl RustGisApp {
 
     /// 导入或工程任务是否都在空闲（文件对话框 / 后台 IO 进行中时禁止再发起新操作）。
     pub(super) fn project_idle(&self) -> bool {
-        self.import.is_none() && self.project_op.is_none()
+        self.import.is_none() && self.project_op.is_none() && self.mask_job.is_none()
     }
 
     /// 弹出系统原生"保存更改？"提示框（按钮：保存 / 不保存 / 取消）。

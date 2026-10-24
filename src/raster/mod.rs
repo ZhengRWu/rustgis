@@ -10,6 +10,7 @@
 //! - 统计值优先读文件内已有的 GDAL 统计（STATISTICS_*），没有时按需计算，
 //!   计算在后台线程执行，不阻塞界面。
 
+pub mod extract_mask;
 mod geotiff;
 mod jp2;
 mod paint;

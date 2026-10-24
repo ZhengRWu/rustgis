@@ -523,15 +523,21 @@ fn geoprocess_window_ui(ctx: &Context, state: &Mutex<GeoDialog>, msgs: &Mutex<Ve
 }
 
 /// 参数区第一行：选择工具（换工具就地重算参数）。
-fn tool_row(ui: &mut egui::Ui, d: &mut GeoDialog, texts: &Texts) {
-    ui.horizontal(|ui| {
-        let resp = ui.label(&texts.tool);
-        if resp.hovered() {
-            d.topic = HelpTopic::Tool;
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+///
+/// 返回「标签」与「下拉」两个响应，测试据此断言下拉不会盖住左边的「工具」。
+fn tool_row(
+    ui: &mut egui::Ui,
+    d: &mut GeoDialog,
+    texts: &Texts,
+) -> (egui::Response, egui::Response) {
+    // 从左往右排：下拉只占「标签右侧的剩余宽度」。若按整行宽度（FORM_WIDTH）
+    // 去画，再加上右对齐布局，下拉会从行首开始铺，正好把「工具」两个字压住。
+    let (label, combo) = ui
+        .horizontal(|ui| {
+            let label = ui.label(&texts.tool);
+            let width = ui.available_width();
             let before = d.op;
-            combo(ui, "geoprocess_tool", &texts.tools, &mut d.op);
+            let combo = combo(ui, "geoprocess_tool", &texts.tools, &mut d.op, width);
             if d.op != before {
                 d.checked.clear();
                 d.output_edited = false;
@@ -539,8 +545,14 @@ fn tool_row(ui: &mut egui::Ui, d: &mut GeoDialog, texts: &Texts) {
                 d.topic = HelpTopic::Tool;
                 d.error = None;
             }
-        });
-    });
+            (label, combo)
+        })
+        .inner;
+    // 悬停标签或下拉都算「指着工具这一项」，右侧帮助跟着切到工具说明。
+    if label.hovered() || combo.hovered() {
+        d.topic = HelpTopic::Tool;
+    }
+    (label, combo)
 }
 
 /// 「输入要素」：勾选顺序即叠加顺序。
@@ -842,17 +854,24 @@ fn label_of<T: PartialEq + Copy>(labels: &[(T, String)], value: T) -> &str {
         .unwrap_or("")
 }
 
-/// 下拉框：与「缓冲区」对话框同一套宽度与样式。
-fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, labels: &[(T, String)], value: &mut T) {
+/// 下拉框：`width` 是按钮宽度，与「缓冲区」对话框同一套样式。
+fn combo<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    id: &str,
+    labels: &[(T, String)],
+    value: &mut T,
+    width: f32,
+) -> egui::Response {
     let selected = label_of(labels, *value).to_string();
     egui::ComboBox::from_id_salt(id)
         .selected_text(selected)
-        .width(FORM_WIDTH - 8.0)
+        .width(width)
         .show_ui(ui, |ui| {
             for (key, label) in labels {
                 ui.selectable_value(value, *key, label);
             }
-        });
+        })
+        .response
 }
 
 /// 勾选 / 取消勾选一个字段（`Vec<String>` 去重）。
@@ -961,6 +980,41 @@ mod tests {
                 "两个窗口各自独立，不应互相关闭"
             );
         }
+    }
+
+    #[test]
+    fn tool_row_combo_does_not_cover_the_tool_label() {
+        let ctx = Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut dialog = GeoDialog::default();
+        let mut rects = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_width(FORM_WIDTH);
+                let texts = Texts {
+                    tool: "工具".to_string(),
+                    tools: vec![(OverlayOp::Clip, "裁剪".to_string())],
+                    ..Texts::default()
+                };
+                let (label, combo) = tool_row(ui, &mut dialog, &texts);
+                rects = Some((label.rect, combo.rect));
+            });
+        });
+        let (label, combo) = rects.expect("工具行应被布局");
+        assert!(
+            combo.left() >= label.right(),
+            "下拉压住了「工具」标签：label={label:?} combo={combo:?}"
+        );
+        assert!(
+            combo.width() > FORM_WIDTH / 2.0,
+            "下拉应占满标签右侧的剩余宽度：{combo:?}"
+        );
     }
 
     #[test]

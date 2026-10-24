@@ -1,9 +1,9 @@
 //! Compact desktop GIS toolbars. Icons are drawn in a 16-point coordinate grid,
 //! so they remain crisp at different display scales without image decoders.
 use super::RustGisApp;
-use egui::{Color32 as C, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
+use egui::{Color32 as C, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, Vec2};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Icon {
     New,
     Open,
@@ -41,6 +41,94 @@ enum Icon {
     Find,
     Xy,
     Time,
+}
+
+impl Icon {
+    /// 全部图标（测试用：保证每个图标都配了标题和说明）。
+    #[cfg(test)]
+    const ALL: [Icon; 36] = [
+        Icon::New,
+        Icon::Open,
+        Icon::Save,
+        Icon::Print,
+        Icon::Cut,
+        Icon::Copy,
+        Icon::Paste,
+        Icon::Delete,
+        Icon::Undo,
+        Icon::Redo,
+        Icon::Add,
+        Icon::Edit,
+        Icon::Table,
+        Icon::Catalog,
+        Icon::Search,
+        Icon::Toolbox,
+        Icon::Console,
+        Icon::Model,
+        Icon::ZoomIn,
+        Icon::ZoomOut,
+        Icon::Pan,
+        Icon::Globe,
+        Icon::Expand,
+        Icon::Contract,
+        Icon::Back,
+        Icon::Forward,
+        Icon::Select,
+        Icon::Clear,
+        Icon::Pointer,
+        Icon::Info,
+        Icon::Link,
+        Icon::Tip,
+        Icon::Measure,
+        Icon::Find,
+        Icon::Xy,
+        Icon::Time,
+    ];
+}
+
+/// 每个工具按钮的悬停提示：(标题 key, 工具介绍 key)。
+///
+/// 标题优先复用菜单文案；图标语义与菜单项不同的（如铅笔 = 编辑器、X = 删除）
+/// 用单独的 key，避免提示里出现牛头不对马嘴的名字。
+fn tip_keys(icon: Icon) -> (&'static str, &'static str) {
+    match icon {
+        Icon::New => ("file.new", "tip.new"),
+        Icon::Open => ("file.open", "tip.open"),
+        Icon::Save => ("file.save", "tip.save"),
+        Icon::Print => ("file.print", "tip.print"),
+        Icon::Cut => ("edit.cut", "tip.cut"),
+        Icon::Copy => ("edit.copy", "tip.copy"),
+        Icon::Paste => ("edit.paste", "tip.paste"),
+        Icon::Delete => ("edit.delete", "tip.delete"),
+        Icon::Undo => ("edit.undo", "tip.undo"),
+        Icon::Redo => ("edit.redo", "tip.redo"),
+        Icon::Add => ("layer.add", "tip.add"),
+        Icon::Edit => ("tools.editor", "tip.edit"),
+        Icon::Table => ("window.contents", "tip.toc"),
+        Icon::Catalog => ("window.catalog", "tip.catalog"),
+        Icon::Search => ("window.search", "tip.search"),
+        Icon::Toolbox => ("toolbox.open", "tip.toolbox"),
+        Icon::Console => ("tools.python", "tip.console"),
+        Icon::Model => ("tools.modelBuilder", "tip.model"),
+        Icon::ZoomIn => ("view.zoomIn", "tip.zoomIn"),
+        Icon::ZoomOut => ("view.zoomOut", "tip.zoomOut"),
+        Icon::Pan => ("view.pan", "tip.pan"),
+        Icon::Globe => ("view.zoomFull", "tip.globe"),
+        Icon::Expand => ("view.zoomIn", "tip.expand"),
+        Icon::Contract => ("view.zoomOut", "tip.contract"),
+        Icon::Back => ("view.prevExtent", "tip.back"),
+        Icon::Forward => ("view.nextExtent", "tip.forward"),
+        Icon::Select => ("select.bySquare", "tip.select"),
+        Icon::Clear => ("select.deselect", "tip.clear"),
+        Icon::Pointer => ("select.features", "tip.pointer"),
+        Icon::Info => ("edit.identify", "tip.info"),
+        Icon::Link => ("insert.hyperlink", "tip.link"),
+        Icon::Tip => ("help.tips", "tip.tip"),
+        Icon::Measure => ("tools.measure", "tip.measure"),
+        Icon::Find => ("window.find", "tip.find"),
+        Icon::Xy => ("view.gotoXy", "tip.xy"),
+        Icon::Time => ("view.timeSlider", "tip.time"),
+    }
 }
 
 impl RustGisApp {
@@ -116,28 +204,11 @@ impl RustGisApp {
                         (Icon::Table, "window.contents"),
                         (Icon::Catalog, "window.catalog"),
                         (Icon::Search, "window.find"),
-                        (Icon::Toolbox, "menu.geoprocessing"),
+                        (Icon::Toolbox, "toolbox.open"),
                         (Icon::Console, "tools.options"),
                         (Icon::Model, "tools.modelBuilder"),
                     ] {
-                        if matches!(icon, Icon::Toolbox) {
-                            ui.menu_button("▾", |ui| {
-                                for key in [
-                                    "overlay.buffer",
-                                    "overlay.clip.menu",
-                                    "overlay.intersect.menu",
-                                    "overlay.union.menu",
-                                    "overlay.merge.menu",
-                                    "overlay.dissolve.menu",
-                                ] {
-                                    if ui.button(self.t(key)).clicked() {
-                                        self.on_menu_item(key);
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        }
-                        self.tool_button(ui, icon, key, false, false);
+                        self.tool_button(ui, icon, key, matches!(icon, Icon::Toolbox), false);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -161,26 +232,31 @@ impl RustGisApp {
                         self.tool_button(ui, icon, key, enabled, selected);
                     }
                     separator(ui);
-                    for (icon, key) in [
-                        (Icon::Select, "select.bySquare"),
-                        (Icon::Clear, "select.deselect"),
-                        (Icon::Pointer, "select.byAttribute"),
-                        (Icon::Info, "edit.properties"),
-                        (Icon::Link, "insert.text"),
-                        (Icon::Tip, "help.help"),
-                        (Icon::Measure, "insert.scalebar"),
-                        (Icon::Find, "window.find"),
-                        (Icon::Xy, "view.dataFrame"),
-                        (Icon::Time, "view.layout"),
+                    for (icon, key, enabled) in [
+                        (Icon::Select, "select.bySquare", false),
+                        (Icon::Clear, "select.deselect", false),
+                        (Icon::Pointer, "select.byAttribute", false),
+                        (Icon::Info, "edit.identify", true),
+                        (Icon::Link, "insert.text", false),
+                        (Icon::Tip, "help.help", false),
+                        (Icon::Measure, "insert.scalebar", false),
+                        (Icon::Find, "window.find", false),
+                        (Icon::Xy, "view.dataFrame", false),
+                        (Icon::Time, "view.layout", false),
                     ] {
-                        self.tool_button(ui, icon, key, false, false);
+                        let selected =
+                            matches!((icon, self.map.tool), (Icon::Info, crate::map::Tool::Info));
+                        self.tool_button(ui, icon, key, enabled, selected);
                     }
                 });
             });
     }
 
     fn tool_button(&mut self, ui: &mut Ui, icon: Icon, key: &str, enabled: bool, selected: bool) {
-        let tip = self.t(key).to_string();
+        let (title_key, desc_key) = tip_keys(icon);
+        let title = self.t(title_key).to_string();
+        let body = self.t(desc_key).to_string();
+        let note = (!enabled).then(|| self.t("toolbar.notImplemented").to_string());
         let response = ui
             .add_enabled_ui(enabled, |ui| {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
@@ -196,14 +272,21 @@ impl RustGisApp {
                 draw_icon(ui.painter(), r.shrink(3.0), icon);
                 response
             })
-            .inner
-            .on_hover_text(tip);
+            .inner;
+        // 灰色（禁用）按钮也要出提示：egui 的 on_hover_ui 对禁用控件不触发，
+        // 必须走 on_disabled_hover_ui（它按控件矩形判断指针，不依赖 hovered）。
+        let response = if enabled {
+            response.on_hover_ui(|ui| tool_tip(ui, &title, &body, None))
+        } else {
+            response.on_disabled_hover_ui(|ui| tool_tip(ui, &title, &body, note.as_deref()))
+        };
         if response.clicked() {
             match icon {
-                Icon::ZoomIn | Icon::ZoomOut | Icon::Pan => {
+                Icon::ZoomIn | Icon::ZoomOut | Icon::Pan | Icon::Info => {
                     self.map.tool = match icon {
                         Icon::ZoomIn => crate::map::Tool::ZoomIn,
                         Icon::ZoomOut => crate::map::Tool::ZoomOut,
+                        Icon::Info => crate::map::Tool::Info,
                         _ => crate::map::Tool::Pan,
                     };
                     self.map.zoom_drag_start = None;
@@ -213,6 +296,18 @@ impl RustGisApp {
                 }
             }
         }
+    }
+}
+
+/// 悬停提示的排版：粗体标题 + 工具介绍；禁用工具再补一行「尚未实现」。
+fn tool_tip(ui: &mut Ui, title: &str, body: &str, note: Option<&str>) {
+    ui.set_max_width(280.0);
+    ui.label(RichText::new(title).strong());
+    ui.add_space(2.0);
+    ui.label(body);
+    if let Some(note) = note {
+        ui.add_space(2.0);
+        ui.weak(note);
     }
 }
 
@@ -509,6 +604,23 @@ fn draw_icon(p: &egui::Painter, r: Rect, icon: Icon) {
                 for x in [5., 10.] {
                     line((x, 6.), (x, 13.), C::GRAY);
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Language;
+
+    #[test]
+    fn every_icon_has_title_and_description_in_all_languages() {
+        for icon in Icon::ALL {
+            let (title_key, desc_key) = tip_keys(icon);
+            for lang in Language::ALL {
+                assert_ne!(lang.t(title_key), title_key, "{icon:?} 缺标题 {title_key}");
+                assert_ne!(lang.t(desc_key), desc_key, "{icon:?} 缺说明 {desc_key}");
             }
         }
     }

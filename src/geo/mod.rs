@@ -840,6 +840,11 @@ impl LayerManager {
         self.roots.clone()
     }
 
+    /// Read-only tree access, including layers inside collapsed groups.
+    pub fn roots(&self) -> &[LayerNode] {
+        &self.roots
+    }
+
     /// 整体替换图层树（工程文件加载路径）：重新编号、选中第一个顶层节点。
     pub fn replace_with(&mut self, mut roots: Vec<LayerNode>) {
         self.next_id = 0;

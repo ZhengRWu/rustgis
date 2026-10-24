@@ -117,6 +117,9 @@ pub static MENUS: &[MenuDef] = &[
     MenuDef {
         label: "menu.geoprocessing",
         entries: &[
+            Entry::Item("toolbox.open"),
+            Entry::Item("raster.extractMask"),
+            Entry::Separator,
             // 缓冲区（ArcGIS 的 Buffer）：独立参数对话框，先于其余工具落地。
             Entry::Item("overlay.buffer"),
             Entry::Separator,
