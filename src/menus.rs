@@ -74,6 +74,7 @@ pub static MENUS: &[MenuDef] = &[
             Entry::Item("view.zoomOut"),
             Entry::Item("view.pan"),
             Entry::Item("view.zoomFull"),
+            Entry::Item("view.gotoXy"),
             Entry::Separator,
             Entry::Item("view.dataFrame"),
             Entry::Item("view.layout"),

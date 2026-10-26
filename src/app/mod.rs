@@ -18,7 +18,9 @@
 
 pub mod attr_table;
 pub mod buffer_dialog;
+mod find;
 pub mod geoprocess_dialog;
+mod goto_xy;
 pub mod identify;
 pub mod import;
 pub mod layers_panel;
@@ -108,6 +110,10 @@ pub struct RustGisApp {
     map: MapState,
     /// 「识别」工具的结果窗口（单击地图后显示最顶层要素 / 像元信息）。
     identify: identify::IdentifyState,
+    /// 「转到 XY」窗口与定位标记。
+    goto_xy: goto_xy::GoToXy,
+    /// 「查找」窗口：按名称 / 属性值检索要素，结果可定位。
+    find: find::Find,
     /// 跨帧复用的地图渲染器（视图不变时直接复用上一帧的形状）。
     map_renderer: map::render::Renderer,
     /// 后台导入流水线（等待文件选择 / 等待解析完成）。
@@ -212,6 +218,8 @@ impl RustGisApp {
             layers: LayerManager::default(),
             map: MapState::default(),
             identify: identify::IdentifyState::default(),
+            goto_xy: goto_xy::GoToXy::default(),
+            find: find::Find::default(),
             map_renderer: map::render::Renderer::default(),
             import: None,
             buffer_dialog: None,
@@ -413,6 +421,16 @@ impl RustGisApp {
                 self.map.tool = Tool::Pan;
                 MenuAction::None
             }
+            // 视图 → 转到 XY（工具条上的 XY 图标同一入口）。
+            "view.gotoXy" => {
+                self.open_goto_xy();
+                MenuAction::None
+            }
+            // 窗口 → 查找（工具条上放大镜 / 查找图标同一入口）。
+            "window.find" => {
+                self.open_find();
+                MenuAction::None
+            }
             other => {
                 // 产品行为约定：未实现功能统一弹出“正在开发中”对话框。
                 let feature = self.t(other).to_string();
@@ -545,6 +563,12 @@ impl eframe::App for RustGisApp {
 
         // 「识别结果」浮窗：地图点击后显示最顶层要素 / 像元信息。
         self.show_identify_window(ctx);
+
+        // 「转到 XY」浮窗：输入工程坐标居中地图。
+        self.show_goto_xy(ctx);
+
+        // 「查找」浮窗：按名称 / 属性值检索要素，双击结果定位。
+        self.show_find(ctx);
 
         // 右下角通知：压在地图之上、模态对话框之下，不遮挡需要确认的窗口；
         // 底部按状态栏实际高度抬起，不盖住坐标 / 比例尺。

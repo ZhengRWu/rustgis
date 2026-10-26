@@ -106,7 +106,7 @@ fn tip_keys(icon: Icon) -> (&'static str, &'static str) {
         Icon::Edit => ("tools.editor", "tip.edit"),
         Icon::Table => ("window.contents", "tip.toc"),
         Icon::Catalog => ("window.catalog", "tip.catalog"),
-        Icon::Search => ("window.search", "tip.search"),
+        Icon::Search => ("window.find", "tip.find"),
         Icon::Toolbox => ("toolbox.open", "tip.toolbox"),
         Icon::Console => ("tools.python", "tip.console"),
         Icon::Model => ("tools.modelBuilder", "tip.model"),
@@ -208,7 +208,8 @@ impl RustGisApp {
                         (Icon::Console, "tools.options"),
                         (Icon::Model, "tools.modelBuilder"),
                     ] {
-                        self.tool_button(ui, icon, key, matches!(icon, Icon::Toolbox), false);
+                        let enabled = matches!(icon, Icon::Toolbox | Icon::Search);
+                        self.tool_button(ui, icon, key, enabled, false);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -240,8 +241,8 @@ impl RustGisApp {
                         (Icon::Link, "insert.text", false),
                         (Icon::Tip, "help.help", false),
                         (Icon::Measure, "insert.scalebar", false),
-                        (Icon::Find, "window.find", false),
-                        (Icon::Xy, "view.dataFrame", false),
+                        (Icon::Find, "window.find", true),
+                        (Icon::Xy, "view.gotoXy", true),
                         (Icon::Time, "view.layout", false),
                     ] {
                         let selected =

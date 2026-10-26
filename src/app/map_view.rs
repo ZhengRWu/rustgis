@@ -195,6 +195,53 @@ impl RustGisApp {
             );
         }
 
+        // 「查找」定位高亮：双击结果后在该要素范围上闪一圈橙色框，几秒后消失。
+        if let Some(bounds) = self.find.highlight {
+            let now = ui.input(|input| input.time);
+            if now < self.find.highlight_until {
+                let min = map::world_to_screen(bounds.min, rect, &view);
+                let max = map::world_to_screen(bounds.max, rect, &view);
+                let r = egui::Rect::from_two_pos(min, max).expand(3.0);
+                if rect.intersects(r) {
+                    painter.rect_stroke(
+                        r,
+                        0.0,
+                        egui::Stroke::new(2.0_f32, super::find::HIGHLIGHT_COLOR),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                // 高亮期间持续出帧，到点后自动清掉。
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(50));
+            } else {
+                self.find.highlight = None;
+            }
+        }
+
+        // 「转到 XY」定位标记：红色十字环，几秒后自动消失。
+        if let Some(marker) = self.goto_xy.marker {
+            let now = ui.input(|input| input.time);
+            if now < self.goto_xy.marker_until {
+                let p = map::world_to_screen(marker, rect, &view);
+                if rect.expand(16.0).contains(p) {
+                    let stroke = egui::Stroke::new(2.0_f32, style::DANGER);
+                    painter.circle_stroke(p, 9.0, stroke);
+                    painter.line_segment(
+                        [p - egui::vec2(15.0, 0.0), p + egui::vec2(15.0, 0.0)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [p - egui::vec2(0.0, 15.0), p + egui::vec2(0.0, 15.0)],
+                        stroke,
+                    );
+                }
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(50));
+            } else {
+                self.goto_xy.marker = None;
+            }
+        }
+
         // 拖放提示：文件悬停在窗口上（尚未松开）时铺一层淡色 + 虚线框，
         // 让用户确认「松手就会加入图层」。与右下角通知同色（ACCENT）。
         if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
