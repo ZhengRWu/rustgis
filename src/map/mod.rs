@@ -24,15 +24,19 @@ pub enum Tool {
     ZoomOut,
     /// 识别：单击地图查询最顶层可视要素 / 像元信息（不改变视图）。
     Info,
+    Measure,
 }
 
 /// 地图交互总状态。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MapState {
     /// None 表示尚未初始化（首次渲染时按图层范围或默认视图设置）。
     pub view: Option<MapView>,
     pub tool: Tool,
     pub zoom_drag_start: Option<Pos2>,
+    pub measure_points: Vec<[f64; 2]>,
+    pub measure_area: bool,
+    pub measure_closed: bool,
 }
 
 impl Default for MapState {
@@ -41,6 +45,9 @@ impl Default for MapState {
             view: None,
             tool: Tool::Pan,
             zoom_drag_start: None,
+            measure_points: Vec::new(),
+            measure_area: false,
+            measure_closed: false,
         }
     }
 }

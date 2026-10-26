@@ -29,7 +29,8 @@ fn main() -> eframe::Result<()> {
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1280.0, 800.0])
-                .with_min_inner_size([960.0, 600.0]),
+                .with_min_inner_size([960.0, 600.0])
+                .with_drag_and_drop(true),
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(app::RustGisApp::new(&cc.egui_ctx)))),

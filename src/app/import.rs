@@ -235,7 +235,7 @@ impl RustGisApp {
 
 /// 拖进窗口的文件是否受支持：栅格（.tif/.tiff/SAFE 目录）或矢量
 /// （.geojson/.json/.shp），与两条导入流水线接受的格式保持一致。
-fn is_supported_drop(path: &Path) -> bool {
+pub(super) fn is_supported_drop(path: &Path) -> bool {
     if super::raster_op::is_raster_path(path) {
         return true;
     }

@@ -17,6 +17,7 @@
 //! 任何时刻都不锁住窗口。
 
 pub mod attr_table;
+mod catalog;
 pub mod buffer_dialog;
 mod find;
 pub mod geoprocess_dialog;
@@ -172,6 +173,8 @@ pub struct RustGisApp {
     raster_painter: crate::raster::RasterPainter,
     /// 右下角通知队列（后台任务完成提示，见 [`toast`]）。
     toasts: toast::ToastHost,
+    /// 右侧本地文件目录（对标 QGIS 浏览器）。
+    catalog: catalog::Catalog,
     /// 用户拖进窗口、尚未开始导入的文件（按顺序逐个交给导入流水线）。
     ///
     /// 拖放可能一次给出多个文件，而导入流水线同一时刻只跑一条（否则两个系统
@@ -246,6 +249,7 @@ impl RustGisApp {
             raster_props: None,
             raster_painter: crate::raster::RasterPainter::default(),
             toasts: toast::ToastHost::default(),
+            catalog: catalog::Catalog::default(),
             drop_queue: std::collections::VecDeque::new(),
             exiting: false,
             title_dirty: false,
@@ -431,6 +435,10 @@ impl RustGisApp {
                 self.open_find();
                 MenuAction::None
             }
+            "window.catalog" => {
+                self.catalog.open = !self.catalog.open;
+                MenuAction::None
+            }
             other => {
                 // 产品行为约定：未实现功能统一弹出“正在开发中”对话框。
                 let feature = self.t(other).to_string();
@@ -510,6 +518,15 @@ impl eframe::App for RustGisApp {
             .resizable(true)
             .frame(panel_frame())
             .show(ctx, |ui| self.layers_panel(ui));
+
+        if self.catalog.open {
+            SidePanel::right("catalog_panel")
+                .min_width(220.0)
+                .default_width(300.0)
+                .resizable(true)
+                .frame(panel_frame())
+                .show(ctx, |ui| self.catalog_panel(ui));
+        }
 
         // 底部状态栏
         let status_bar = TopBottomPanel::bottom("status_bar")

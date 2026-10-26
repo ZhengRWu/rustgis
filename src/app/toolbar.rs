@@ -208,7 +208,7 @@ impl RustGisApp {
                         (Icon::Console, "tools.options"),
                         (Icon::Model, "tools.modelBuilder"),
                     ] {
-                        let enabled = matches!(icon, Icon::Toolbox | Icon::Search);
+                        let enabled = matches!(icon, Icon::Catalog | Icon::Toolbox | Icon::Search);
                         self.tool_button(ui, icon, key, enabled, false);
                     }
                 });
@@ -229,6 +229,7 @@ impl RustGisApp {
                             (Icon::Pan, crate::map::Tool::Pan)
                                 | (Icon::ZoomIn, crate::map::Tool::ZoomIn)
                                 | (Icon::ZoomOut, crate::map::Tool::ZoomOut)
+                                | (Icon::Measure, crate::map::Tool::Measure)
                         );
                         self.tool_button(ui, icon, key, enabled, selected);
                     }
@@ -240,13 +241,13 @@ impl RustGisApp {
                         (Icon::Info, "edit.identify", true),
                         (Icon::Link, "insert.text", false),
                         (Icon::Tip, "help.help", false),
-                        (Icon::Measure, "insert.scalebar", false),
+                        (Icon::Measure, "tools.measure", true),
                         (Icon::Find, "window.find", true),
                         (Icon::Xy, "view.gotoXy", true),
                         (Icon::Time, "view.layout", false),
                     ] {
                         let selected =
-                            matches!((icon, self.map.tool), (Icon::Info, crate::map::Tool::Info));
+                            matches!((icon, self.map.tool), (Icon::Info, crate::map::Tool::Info) | (Icon::Measure, crate::map::Tool::Measure));
                         self.tool_button(ui, icon, key, enabled, selected);
                     }
                 });
@@ -283,11 +284,12 @@ impl RustGisApp {
         };
         if response.clicked() {
             match icon {
-                Icon::ZoomIn | Icon::ZoomOut | Icon::Pan | Icon::Info => {
+                Icon::ZoomIn | Icon::ZoomOut | Icon::Pan | Icon::Info | Icon::Measure => {
                     self.map.tool = match icon {
                         Icon::ZoomIn => crate::map::Tool::ZoomIn,
                         Icon::ZoomOut => crate::map::Tool::ZoomOut,
                         Icon::Info => crate::map::Tool::Info,
+                        Icon::Measure => crate::map::Tool::Measure,
                         _ => crate::map::Tool::Pan,
                     };
                     self.map.zoom_drag_start = None;

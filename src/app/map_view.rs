@@ -10,6 +10,41 @@ use crate::style;
 
 use super::RustGisApp;
 
+fn measure_segment(a: [f64; 2], b: [f64; 2], model: Option<crate::geo::ProjectionModel>) -> f64 {
+    if model == Some(crate::geo::ProjectionModel::Geographic) {
+        let (lat1, lat2) = (a[1].to_radians(), b[1].to_radians());
+        let dlat = lat2 - lat1;
+        let dlon = (b[0] - a[0]).to_radians();
+        let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+        6_371_008.8 * 2.0 * h.sqrt().atan2((1.0 - h).sqrt())
+    } else {
+        ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt()
+    }
+}
+
+fn measure_polygon_area(points: &[[f64; 2]], model: Option<crate::geo::ProjectionModel>) -> f64 {
+    let mut area = 0.0;
+    for i in 0..points.len() {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        area += if model == Some(crate::geo::ProjectionModel::Geographic) {
+            (b[0] - a[0]).to_radians() * (2.0 + a[1].to_radians().sin() + b[1].to_radians().sin())
+        } else { a[0] * b[1] - b[0] * a[1] };
+    }
+    let area = area.abs() * 0.5;
+    if model == Some(crate::geo::ProjectionModel::Geographic) { area * 6_371_008.8_f64.powi(2) } else { area }
+}
+
+fn format_measure_distance(meters_or_units: f64) -> String {
+    if meters_or_units >= 1000.0 { format!("{:.3} km", meters_or_units / 1000.0) }
+    else { format!("{:.1} m", meters_or_units) }
+}
+
+fn format_measure_area(square_meters_or_units: f64) -> String {
+    if square_meters_or_units >= 1_000_000.0 { format!("{:.3} km²", square_meters_or_units / 1_000_000.0) }
+    else { format!("{:.1} m²", square_meters_or_units) }
+}
+
 /// 滚轮缩放灵敏度：每 1 点滚动 delta 对应的对数缩放量。
 ///
 /// egui 一次滚轮格 ≈ `line_scroll_speed` = 40 点，故一格 ≈ `e^(0.012×40) ≈ 1.62×`。
@@ -23,6 +58,7 @@ impl RustGisApp {
     /// 中央地图视图（渲染 + 平移/缩放交互）。
     pub(super) fn map_panel(&mut self, ui: &mut Ui) {
         let rect = ui.max_rect();
+        self.finish_catalog_drag(ui, rect);
         if rect.width() < 8.0 || rect.height() < 8.0 {
             self.cursor_world = None;
             return;
@@ -104,6 +140,9 @@ impl RustGisApp {
                 // egui 没有「信息」光标，Help（问号）是语义最接近的一个。
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Help);
             }
+            if self.map.tool == map::Tool::Measure && (response.hovered() || response.dragged()) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
         }
 
         // 识别工具：单击地图 → 查询最顶层可视要素 / 像元（只读，不移动视图）。
@@ -112,6 +151,39 @@ impl RustGisApp {
             && let Some(pos) = response.interact_pointer_pos()
         {
             self.identify_at(pos, rect, &view);
+        }
+
+        if self.map.tool == map::Tool::Measure {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.map.measure_points.clear();
+                self.map.measure_area = false;
+                self.map.measure_closed = false;
+            }
+            if response.clicked_by(egui::PointerButton::Primary)
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let point = map::world_at(pos, rect, &view);
+                let close_distance = 12.0_f32;
+                let first_screen = self.map.measure_points.first().map(|p| map::world_to_screen(*p, rect, &view));
+                let closes_polygon = self.map.measure_area
+                    && self.map.measure_points.len() >= 3
+                    && first_screen.is_some_and(|first| first.distance(pos) <= close_distance);
+                if closes_polygon {
+                    self.map.measure_closed = true;
+                } else {
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    if self.map.measure_points.is_empty() {
+                        self.map.measure_area = shift;
+                        self.map.measure_points.push(point);
+                    } else if self.map.measure_area == shift {
+                        self.map.measure_points.push(point);
+                    } else {
+                        self.map.measure_points = vec![point];
+                        self.map.measure_area = shift;
+                        self.map.measure_closed = false;
+                    }
+                }
+            }
         }
 
         // 滚轮缩放（以光标为中心）。
@@ -149,6 +221,7 @@ impl RustGisApp {
         // 地图画布为白色（GIS 底图习惯），与整应用白底一致。
         painter.rect_filled(rect, 0.0, style::WHITE);
 
+
         if self.layers.is_empty() {
             // 空数据占位说明：与全应用一致，文字默认纯黑。
             let ink = style::TEXT;
@@ -184,6 +257,37 @@ impl RustGisApp {
                 self.project_projection.as_ref(),
             );
         }
+
+        if !self.map.measure_points.is_empty() {
+            let mut screen_points: Vec<egui::Pos2> = self.map.measure_points.iter()
+                .map(|p| map::world_to_screen(*p, rect, &view)).collect();
+            let cursor = if self.map.tool == map::Tool::Measure && !self.map.measure_closed { response.hover_pos() } else { None };
+            if let Some(pos) = cursor { screen_points.push(pos); }
+            if self.map.measure_area && self.map.measure_closed && screen_points.len() >= 3 {
+                screen_points.push(screen_points[0]);
+            }
+            if screen_points.len() > 1 {
+            painter.add(egui::Shape::line(screen_points.clone(), egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(220, 70, 40))));
+            }
+            for p in screen_points.iter().take(self.map.measure_points.len()) {
+                painter.circle_filled(*p, 4.0, egui::Color32::WHITE);
+                painter.circle_stroke(*p, 4.0, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(220, 70, 40)));
+            }
+            let mut meters = 0.0;
+            for pair in self.map.measure_points.windows(2) {
+                meters += measure_segment(pair[0], pair[1], self.project_projection.as_ref().map(|p| p.model));
+            }
+            let mut label = format!("{}: {}", self.t("measure.distance"), format_measure_distance(meters));
+            if self.map.measure_area && self.map.measure_closed && self.map.measure_points.len() >= 3 {
+                let area = measure_polygon_area(&self.map.measure_points, self.project_projection.as_ref().map(|p| p.model));
+                label.push_str(&format!("\n{}: {}", self.t("measure.area"), format_measure_area(area)));
+            }
+            let anchor = cursor.unwrap_or_else(|| *screen_points.last().unwrap());
+            let label_rect = egui::Rect::from_min_size(anchor + egui::vec2(10.0, 10.0), egui::vec2(190.0, 42.0));
+            painter.rect_filled(label_rect, 3.0, egui::Color32::from_white_alpha(235));
+            painter.text(label_rect.min + egui::vec2(5.0, 4.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(13.0), style::TEXT);
+        }
+
 
         if let Some(selection) = zoom_box {
             painter.rect_filled(selection, 0.0, style::ACCENT.gamma_multiply(0.08));
@@ -244,7 +348,7 @@ impl RustGisApp {
 
         // 拖放提示：文件悬停在窗口上（尚未松开）时铺一层淡色 + 虚线框，
         // 让用户确认「松手就会加入图层」。与右下角通知同色（ACCENT）。
-        if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
+        if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) || self.catalog.dragging_file.is_some() {
             let frame = rect.shrink(6.0);
             painter.rect_filled(frame, 0.0, style::ACCENT.gamma_multiply(0.06));
             painter.extend(egui::Shape::dashed_line(
