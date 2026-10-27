@@ -82,7 +82,7 @@ pub(super) enum GeoMsg {
 
 /// 独立的地理处理窗口：界面状态 + 与主线程通信的邮箱。
 pub(super) struct GeoWindow {
-    /// 视口 id：必须每帧用同一个 id 调 `show_viewport_deferred`，窗口才会持续存在。
+    /// 视口 id：必须每帧用同一个 id 显示视口，窗口才会持续存在。
     id: ViewportId,
     /// 界面状态（窗口回调与主线程共享）。
     state: Arc<Mutex<GeoDialog>>,
@@ -296,7 +296,7 @@ impl RustGisApp {
             .with_resizable(true)
             .with_active(true);
         let window_msgs = Arc::clone(&msgs);
-        ctx.show_viewport_deferred(id, builder, move |ctx, _class| {
+        ctx.show_viewport_immediate(id, builder, move |ctx, _class| {
             geoprocess_window_ui(ctx, &state, &window_msgs);
         });
 

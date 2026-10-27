@@ -90,32 +90,60 @@ impl RustGisApp {
         if !self.identify.open {
             return;
         }
-        let mut open = true;
         let hit = self.identify.hit.clone();
         let lang = self.language;
         let title = lang.t("identify.title").to_string();
+        let main_rect = ctx
+            .input(|input| input.viewport().outer_rect)
+            .unwrap_or_else(|| ctx.screen_rect());
         let pos = egui::pos2(
-            (ctx.screen_rect().right() - 380.0).max(16.0),
-            ctx.screen_rect().top() + 96.0,
+            (main_rect.right() - 396.0).max(main_rect.left() + 16.0),
+            main_rect.top() + 96.0,
         );
-        egui::Window::new(title)
-            .id(egui::Id::new("identify_window"))
-            .open(&mut open)
-            .default_pos(pos)
-            .default_width(360.0)
-            .max_width(460.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("identify_results")
-                    .max_height(420.0)
-                    .show(ui, |ui| {
-                        if let Some(hit) = &hit {
-                            hit_ui(ui, hit, lang);
-                        }
+        let viewport_id = egui::ViewportId::from_hash_of("identify_result_viewport");
+        let viewport = egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            .with_inner_size([380.0, 460.0])
+            .with_min_inner_size([280.0, 180.0])
+            .with_resizable(true)
+            .with_close_button(true)
+            .with_position(pos);
+
+        let close_requested = ctx.show_viewport_immediate(viewport_id, viewport, |viewport_ctx, class| {
+            if class == egui::ViewportClass::Embedded {
+                let mut open = true;
+                egui::Window::new(title.clone())
+                    .id(egui::Id::new("identify_window"))
+                    .open(&mut open)
+                    .default_pos(pos)
+                    .default_width(360.0)
+                    .max_width(460.0)
+                    .resizable(true)
+                    .show(viewport_ctx, |ui| show_hit(ui, hit.as_ref(), lang));
+                !open
+            } else {
+                if viewport_ctx.input(|input| input.viewport().close_requested()) {
+                    true
+                } else {
+                    egui::CentralPanel::default().show(viewport_ctx, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("identify_results")
+                            .max_height(420.0)
+                            .show(ui, |ui| show_hit(ui, hit.as_ref(), lang));
                     });
-            });
-        self.identify.open = open;
+                    false
+                }
+            }
+        });
+        if close_requested {
+            self.identify.open = false;
+        }
+    }
+}
+
+fn show_hit(ui: &mut egui::Ui, hit: Option<&Hit>, lang: crate::i18n::Language) {
+    if let Some(hit) = hit {
+        hit_ui(ui, hit, lang);
     }
 }
 

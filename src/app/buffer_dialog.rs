@@ -85,7 +85,7 @@ pub(super) enum BufferMsg {
 
 /// 独立的「缓冲区」窗口：界面状态 + 与主线程通信的邮箱。
 pub(super) struct BufferWindow {
-    /// 视口 id：必须每帧用同一个 id 调 `show_viewport_deferred`，窗口才会持续存在。
+    /// 视口 id：必须每帧用同一个 id 显示视口，窗口才会持续存在。
     id: ViewportId,
     /// 界面状态（窗口回调与主线程共享）。
     state: Arc<Mutex<BufferDialog>>,
@@ -297,7 +297,7 @@ impl RustGisApp {
             .with_active(true);
         // 邮箱再克隆一份给闭包：本帧的窗口回调与稍后的取消息各用一份。
         let window_msgs = Arc::clone(&msgs);
-        ctx.show_viewport_deferred(id, builder, move |ctx, _class| {
+        ctx.show_viewport_immediate(id, builder, move |ctx, _class| {
             buffer_window_ui(ctx, &state, &window_msgs);
         });
 
