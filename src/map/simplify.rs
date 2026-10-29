@@ -17,8 +17,11 @@
 //! 把世界坐标转到屏幕坐标后依次处理：
 //!
 //! 1. **去重** —— 丢弃与前一点距离小于 [`MIN_SEGMENT`] 的顶点；
-//! 2. **去折返** —— 丢弃 miter 外扩倍率超过 [`MITER_LIMIT`] 的顶点，
-//!    相当于补上 epaint 缺失的 miter limit（闭合环还会补查接缝处）；
+//! 2. **去折返** —— miter 外扩倍率超过 [`MITER_LIMIT`] 的顶点做「削平」：
+//!    沿角平分线的垂直方向拆成相距 [`STRADDLE_PX`] 的一对点（等价于 bevel
+//!    斜切），转角从接近 180° 降到 ~90°，miter 不再失控，同时**保住折返处
+//!    的真实轮廓**——细长多边形（数字化自相交拆出的碎片、地块缝隙）的尖角
+//!    不会被删掉。邻边过短削不动时才退回删除（闭合环还会补查接缝处）；
 //! 3. **抽稀** —— 按 [`SIMPLIFY_TOLERANCE`] 做 Douglas-Peucker。
 //!
 //! 第 3 步既是尺度自适应的抗锯齿（用户可见的"缩小后自动平滑边、减少顶点"），
@@ -33,8 +36,12 @@ use crate::map::{MapView, Projector};
 const MIN_SEGMENT: f32 = 0.1;
 
 /// miter 外扩倍率上限。epaint 的实际外扩倍率为 `1 / |cos(φ/2)|`（φ 为转角），
-/// 超过该值即丢弃该顶点；`4.0` 约等于"转角超过 151° 视为折返"。
+/// 超过该值即视为折返；`4.0` 约等于"转角超过 151° 视为折返"。
 const MITER_LIMIT: f32 = 4.0;
+
+/// 折返顶点「削平」的间距（像素）：拆成的一对点相距 `2 × STRADDLE_PX`。
+/// 1px 在任何缩放下都不可辨，却能把折返的转角压到 ~90°。
+const STRADDLE_PX: f32 = 1.0;
 
 /// Douglas-Peucker 抽稀容差（屏幕像素）。亚像素级，肉眼不可辨。
 const SIMPLIFY_TOLERANCE: f32 = 0.75;
@@ -163,7 +170,7 @@ fn dedup(pts: &mut Vec<Pos2>, closed: bool) {
     }
 }
 
-/// 丢掉会让 miter 外扩爆掉的折返顶点。
+/// 丢掉会让 miter 外扩爆掉的折返顶点（削不动时），其余削平成一对点。
 ///
 /// 单轮的线性扫描必然收敛；只有闭合环的"接缝"清理可能牵动链首/链尾，
 /// 因此外层反复滚动直到不再变化（每轮至少少一个顶点，故必然终止）。
@@ -180,25 +187,61 @@ fn remove_reversals(pts: &mut Vec<Pos2>, closed: bool) {
     }
 }
 
-/// 线性扫描：原地用写游标维护输出栈，末尾三点构成折返就丢掉中间点（可能连锁）。
+/// 线性扫描：原地用写游标维护输出栈，末尾三点构成折返就削平中间点（可能连锁）。
 ///
 /// 写游标 `w` 恒不大于读游标 `r`，因此不需要额外的输出缓冲 ——
 /// 这一步在每个可见路径上都要跑，省掉的是每帧每路径一次 `Vec` 分配。
 fn linear_pass(pts: &mut Vec<Pos2>) {
-    let mut w = 0usize;
-    for r in 0..pts.len() {
+    let mut r = 0usize; // 读游标
+    let mut w = 0usize; // 写游标
+    while r < pts.len() {
         pts[w] = pts[r];
         w += 1;
+        r += 1;
         while w >= 3 {
             if !is_reversal(pts[w - 3], pts[w - 2], pts[w - 1]) {
                 break;
             }
-            // 用末尾点覆盖中间点再回退游标，等价于移除中间点，且是 O(1)。
-            pts[w - 2] = pts[w - 1];
-            w -= 1;
+            let (a, b, c) = (pts[w - 3], pts[w - 2], pts[w - 1]);
+            if let Some((b1, b2)) = straddle_reversal(a, b, c) {
+                // 削平：b 拆成 b1、b2 两点。插入点落在已写区内（w-1 ≤ r-1），
+                // 未读元素整体右移一格，读游标同步 +1 即可继续对上。
+                pts[w - 2] = b1;
+                pts.insert(w - 1, b2);
+                w += 1;
+                r += 1;
+            } else {
+                // 邻边过短削不动（亚像素级），退回删除：用末尾点覆盖中间点
+                // 再回退游标，等价于移除中间点，且是 O(1)。
+                pts[w - 2] = pts[w - 1];
+                w -= 1;
+            }
         }
     }
     pts.truncate(w);
+}
+
+/// 折返顶点的削平：把 `b` 沿垂直于角平分线的方向拆成相距 `2 × STRADDLE_PX`
+/// 的一对点。折返的转角（接近 180°）由此降为两个 ~90° 的普通转角，
+/// miter 外扩回到 [`MITER_LIMIT`] 之内，而折返处的真实轮廓得以保留。
+///
+/// 邻边短于 `2 × STRADDLE_PX` 时削平会引入新的病态几何，返回 `None`
+/// 让调用方退回删除（这种环在屏幕上本就是亚像素级的，删了不可见）。
+fn straddle_reversal(a: Pos2, b: Pos2, c: Pos2) -> Option<(Pos2, Pos2)> {
+    let u = b - a;
+    let v = c - b;
+    let (lu, lv) = (u.length(), v.length());
+    if lu < 2.0 * STRADDLE_PX || lv < 2.0 * STRADDLE_PX {
+        return None;
+    }
+    // 角平分线方向（入边与出边单位向量之差）；折返处两者接近反向，差向量不会退化。
+    let m = u.normalized() - v.normalized();
+    let mlen = m.length();
+    if mlen < 1e-6 {
+        return None;
+    }
+    let p = m.rot90() / mlen; // 垂直于角平分线
+    Some((b + p * STRADDLE_PX, b - p * STRADDLE_PX))
 }
 
 /// 闭合环的接缝补查：线性扫描看不到"最后一个顶点的出边"与"首顶点的出入边"，
@@ -206,13 +249,35 @@ fn linear_pass(pts: &mut Vec<Pos2>) {
 fn seam_pass(pts: &mut Vec<Pos2>) {
     loop {
         let n = pts.len();
-        if n < 4 {
+        // 3 点环也要查接缝：细长三角形的尖角折返正好可能落在接缝上
+        // （削平后变 4 点；走删除路径时退化到 2 点，由收口逻辑清空）。
+        if n < 3 {
             return;
         }
         if is_reversal(pts[n - 2], pts[n - 1], pts[0]) {
-            pts.pop();
+            match straddle_reversal(pts[n - 2], pts[n - 1], pts[0]) {
+                // 环序 ...a → b1 → b2 → c(=pts[0])：b2 追加到末尾正好落在
+                // b1 与首点之间（闭合环的接缝就在末尾与首点之间）。
+                Some((b1, b2)) => {
+                    pts[n - 1] = b1;
+                    pts.push(b2);
+                }
+                None => {
+                    pts.pop();
+                }
+            }
         } else if is_reversal(pts[n - 1], pts[0], pts[1]) {
-            pts.remove(0);
+            match straddle_reversal(pts[n - 1], pts[0], pts[1]) {
+                // 环序 ...a(末尾) → b1 → b2 → c(=pts[1])：b1 插到最前、
+                // b2 顶替原首点，接缝两侧的顺序保持不变。
+                Some((b1, b2)) => {
+                    pts[0] = b2;
+                    pts.insert(0, b1);
+                }
+                None => {
+                    pts.remove(0);
+                }
+            }
         } else {
             return;
         }
@@ -362,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn hairpin_vertex_is_removed() {
+    fn hairpin_vertex_is_flattened_not_removed() {
         let (rect, view) = identity_view();
         // A → B → C，其中 C 几乎回到 A 附近：B 是折返顶点
         let line = world(&[(0.0, 0.0), (100.0, 0.0), (0.2, 0.05), (0.2, 40.0)]);
@@ -372,6 +437,8 @@ mod tests {
             "折返未被清除，最大 miter 倍率 = {}",
             max_miter(&pts, false)
         );
+        // 削平（而非删除）：折返顶点拆成一对点，折返处的路径形状保留。
+        assert!(pts.len() >= 4, "削平后应保留折返处的一对点，实得 {pts:?}");
     }
 
     #[test]
@@ -440,18 +507,39 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_sliver_ring_is_skipped() {
+    fn degenerate_sliver_ring_is_flattened_safely() {
         let (rect, view) = identity_view();
-        // 3 个点、其中路径"去而复返"（B 之后折回 A 与 B 之间）：删无可删，
-        // 这种亚像素细缝环应当直接放弃描边，否则 miter 照样爆炸。
+        // 3 个点、其中路径"去而复返"（B 之后折回 A 与 B 之间）：折返顶点被
+        // 削平成一对点后保留描边——与 QGIS 一致，细长多边形不丢轮廓；
+        // 但绝不允许 miter 失控。
         let sliver = world(&[(0.0, 0.0), (200.0, 0.1), (100.0, 0.05)]);
+        let pts = stroke_path(&sliver, rect, &view, true);
         assert!(
-            stroke_path(&sliver, rect, &view, true).is_empty(),
-            "退化细缝环未被丢弃"
+            !pts.is_empty() && max_miter(&pts, true) <= MITER_LIMIT + 1e-3,
+            "细缝环描边丢失或 miter 失控：{pts:?}"
         );
         // 同为 3 点的正常三角形必须保留
         let triangle = world(&[(0.0, 0.0), (100.0, 0.0), (50.0, 80.0)]);
         assert_eq!(stroke_path(&triangle, rect, &view, true).len(), 3);
+    }
+
+    /// 回归用例：细长三角形（数字化自相交拆出的碎片）的尖角折返必须被削平
+    /// 而不是连轮廓一起丢掉——否则填充在、描边没了（截图 bug）。
+    #[test]
+    fn thin_sliver_triangle_keeps_its_outline() {
+        let (rect, view) = identity_view();
+        // 顶角 ~7° 的细长三角：底边两个顶点相距 12px，尖点在 100px 之外。
+        let ring = world(&[(0.0, 0.0), (12.0, 0.0), (100.0, 100.0)]);
+        let pts = stroke_path(&ring, rect, &view, true);
+        assert!(
+            !pts.is_empty(),
+            "细长三角形的描边不应被整体丢弃"
+        );
+        assert!(
+            max_miter(&pts, true) <= MITER_LIMIT + 1e-3,
+            "削平后 miter 仍失控：{}",
+            max_miter(&pts, true)
+        );
     }
 
     /// 视口粗筛：完全在视口外的路径必须被整条丢弃（这正是缩小视图时

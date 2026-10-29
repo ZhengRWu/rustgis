@@ -186,6 +186,13 @@ impl RustGisApp {
             }
         }
 
+        // 数字化（新建矢量后自动进入，手势对标 QGIS `QgsMapToolCapture`）：
+        // 左键加点 / 右键结束 / Backspace·Delete 撤点 / Esc 放弃；中键拖动平移，
+        // 滚轮缩放照常。
+        if self.editing.is_some() {
+            self.handle_digitize(ui, &response, rect, &view);
+        }
+
         // 滚轮缩放（以光标为中心）。
         //
         // egui 的符号约定：`smooth_scroll_delta.y > 0` 表示"滚轮向前 / 内容下移"，
@@ -257,6 +264,9 @@ impl RustGisApp {
                 self.project_projection.as_ref(),
             );
         }
+
+        // 数字化草图（节点 + 连线 + 橡皮筋）画在图层之上。
+        self.paint_draft(&painter, rect, &view);
 
         if !self.map.measure_points.is_empty() {
             let mut screen_points: Vec<egui::Pos2> = self.map.measure_points.iter()

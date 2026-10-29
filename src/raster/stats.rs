@@ -63,6 +63,25 @@ impl StatsAccumulator {
         }
     }
 
+    /// 合并另一个累加器（并行统计时每个线程算一段行带，最后归并）。
+    ///
+    /// 直方图水塘直接拼接；超过上限时按步长抽稀——两段各自都是均匀样本，
+    /// 拼接后仍是均匀样本，抽稀不影响代表性。
+    pub(crate) fn merge_from(&mut self, other: StatsAccumulator) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.sum_sq += other.sum_sq;
+        self.valid_count += other.valid_count;
+        self.seen += other.seen;
+        self.reservoir.extend(other.reservoir);
+        if self.reservoir.len() > SAMPLE_CAP {
+            let step = self.reservoir.len().div_ceil(SAMPLE_CAP);
+            let thinned = self.reservoir.iter().step_by(step).copied().collect();
+            self.reservoir = thinned;
+        }
+    }
+
     /// 汇总结果。
     pub fn finish(mut self) -> BandStatistics {
         if self.valid_count == 0 || !self.min.is_finite() || !self.max.is_finite() {
@@ -198,5 +217,31 @@ mod tests {
         let (low, high) = stats.clipped(0.5);
         assert!(low > 0.0 && low < 100.0, "low={low}");
         assert!(high > 900.0 && high < 1000.0, "high={high}");
+    }
+
+    /// 并行统计的归并：两段累加器合并后与整体单遍累计结果一致。
+    #[test]
+    fn merged_accumulator_matches_single_pass() {
+        let mut whole = StatsAccumulator::new();
+        for value in 0..10_000u32 {
+            whole.add(f64::from(value), None);
+        }
+
+        let mut halves = [StatsAccumulator::new(), StatsAccumulator::new()];
+        for value in 0..10_000u32 {
+            halves[usize::from(value >= 5000)].add(f64::from(value), None);
+        }
+        let (a, b) = halves.split_at_mut(1);
+        a[0].merge_from(std::mem::take(&mut b[0]));
+
+        let merged = std::mem::take(&mut a[0]).finish();
+        let single = whole.finish();
+        assert_eq!(merged.valid_count, single.valid_count);
+        assert_eq!(merged.min, single.min);
+        assert_eq!(merged.max, single.max);
+        assert!((merged.mean - single.mean).abs() < 1e-9);
+        assert!((merged.std_dev - single.std_dev).abs() < 1e-6);
+        assert_eq!(merged.histogram.len(), single.histogram.len());
+        assert!(!merged.histogram.is_empty());
     }
 }

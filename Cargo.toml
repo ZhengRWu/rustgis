@@ -20,6 +20,10 @@ shapefile = { version = "0.9", features = ["encoding_rs", "geo-types"] }
 rfd = { version = "0.15", features = ["common-controls-v6"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 矢量落盘（v0.5）：Shapefile 的属性表是 dBASE 表，写 `.dbf` 需要它
+# （`shapefile` 的 Writer 直接吃 `dbase::TableWriterBuilder`）。
+# 原先只在测试里生成样例 Shapefile，现在新建矢量要真正写盘，升为正式依赖。
+dbase = "0.8"
 # 空间分析（v0.2.2）：缓冲区几何运算全部走 geo。
 # geo 自带 Buffer（i_overlay 的 stroke/outline：圆角连接 + 圆/方/平端帽）、
 # BooleanOps（融合/挖孔）与基于 earcut 的三角剖分；纯 Rust、无 C 依赖。
@@ -28,6 +32,10 @@ geo = "0.33"
 # 内置 LZW / Deflate / PackBits / Fax / JPEG 解压，无需任何 C 依赖。
 # 它已是 image（egui 的贴图依赖）的传递依赖，显式声明后可直接使用其分块读取 API。
 tiff = "0.11"
+# LZW 容错回退（v0.4）：tiff crate 对边缘瓦片的逐行小缓冲读取，在个别 LZW 流上
+# 会触发 weezl 的 NoProgress 误报（"no lzw end code found"，流本身完整）。
+# 回退路径绕过 tiff 的流式包装，直接整段解码后自行裁剪 / 应用预测器。
+weezl = "0.1"
 # Sentinel-2 SAFE（v0.4）：SAFE 包里的波段是 JPEG2000（.jp2）编码，
 # 纯 Rust 解码器 j2k 支持按区域（ROI）与缩放倍率解码，正好匹配
 # 「只解码视窗内像素 + 按缩放级别降采样」的显示管线，无 C 依赖。
@@ -35,10 +43,7 @@ j2k = "0.12"
 # SAFE 包的元数据是 XML（MTD_MSIL*.xml）：用纯 Rust 的流式解析器读取
 # 波段清单、地理编码与产品级别，不引入 C 依赖。
 quick-xml = "0.37"
-
-[dev-dependencies]
-# 仅测试用：生成真实 Shapefile 以做端到端导入链路验证（版本与 shapefile 依赖一致）。
-dbase = "0.8"
+# （`dbase` 已升为正式依赖：新建矢量的落盘要用它构造 dBASE 字段。）
 
 [target.'cfg(windows)'.build-dependencies]
 # build.rs 用它把 ComCtl32 v6 应用 manifest 嵌入 exe（见 resources/ 与 build.rs）。

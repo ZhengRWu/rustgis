@@ -147,6 +147,9 @@ impl RustGisApp {
         self.map.view = None; // 下一帧按默认范围自动适配
         self.zoom_extent = None; // 丢弃旧工程排队的「缩放至图层」
         self.attr_table = None; // 旧工程的属性表指向已不存在的图层，一并关闭
+        // 数字化会话指向旧工程的图层：一并结束，工具退回平移。
+        self.editing = None;
+        self.map.tool = crate::map::Tool::Pan;
         self.project_projection = None; // 新工程从"未设置投影"开始
         self.project_path = None;
         self.dirty = false;

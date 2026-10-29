@@ -8,7 +8,8 @@ use super::RustGisApp;
 
 pub(super) struct Catalog {
     pub open: bool,
-    location: PathBuf,
+    /// 当前目录（`pub(super)`：新建矢量对话框要用它预填落盘路径）。
+    pub(super) location: PathBuf,
     address: String,
     error: Option<String>,
     merge_shapefile: bool,
@@ -22,6 +23,8 @@ pub(super) struct Catalog {
 enum CatalogAction {
     Rename(PathBuf),
     Delete(PathBuf),
+    /// 新建文件夹：`PathBuf` 是**父目录**，新名字在 `rename_value` 里。
+    NewFolder(PathBuf),
 }
 
 impl Default for Catalog {
@@ -139,6 +142,16 @@ impl RustGisApp {
         });
         ui.separator();
         let location = self.catalog.location.clone();
+        // 空白区域的右键菜单：先登记一块「不占布局」的背景交互区
+        // （`ui.interact` 只注册控件、不推进光标），随后画的文件条目排在它上面，
+        // 因此点条目走条目自己的菜单、点空白处走这里的「新建」菜单。
+        let blank_rect = ui.available_rect_before_wrap();
+        let blank = ui.interact(
+            blank_rect,
+            egui::Id::new("catalog_blank"),
+            egui::Sense::click(),
+        );
+        self.catalog_blank_menu(&blank);
         egui::ScrollArea::vertical().id_salt("catalog_tree").show(ui, |ui| {
             self.catalog_directory(ui, &location);
         });
@@ -244,6 +257,25 @@ impl RustGisApp {
         }
     }
 
+    /// 目录栏空白处右键 →「新建」子菜单（对标 QGIS 浏览器：New → Directory… / ShapeFile…）。
+    fn catalog_blank_menu(&mut self, response: &egui::Response) {
+        response.context_menu(|ui| {
+            let new_label = self.t("catalog.new").to_string();
+            ui.menu_button(new_label, |ui| {
+                if ui.button(self.t("catalog.newVector")).clicked() {
+                    self.open_new_vector_dialog();
+                    ui.close_menu();
+                }
+                if ui.button(self.t("catalog.newFolder")).clicked() {
+                    self.catalog.rename_value = self.t("catalog.newFolderName").to_string();
+                    self.catalog.pending_action =
+                        Some(CatalogAction::NewFolder(self.catalog.location.clone()));
+                    ui.close_menu();
+                }
+            });
+        });
+    }
+
     fn begin_catalog_rename(&mut self, path: &Path) {
         self.catalog.rename_value = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         self.catalog.pending_action = Some(CatalogAction::Rename(path.to_path_buf()));
@@ -255,8 +287,18 @@ impl RustGisApp {
             self.show_catalog_delete_window(ctx, path);
             return;
         }
+        // 「重命名」与「新建文件夹」都是「输入一个名字」的对话框，共用同一段界面。
         let is_rename = matches!(action, CatalogAction::Rename(_));
-        let title = self.t(if is_rename { "catalog.rename" } else { "catalog.delete" }).to_string();
+        let is_folder = matches!(action, CatalogAction::NewFolder(_));
+        let title = self
+            .t(if is_rename {
+                "catalog.rename"
+            } else if is_folder {
+                "catalog.newFolder"
+            } else {
+                "catalog.delete"
+            })
+            .to_string();
         let mut open = true;
         let mut commit = false;
         let mut cancel = false;
@@ -266,8 +308,17 @@ impl RustGisApp {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                if is_rename {
-                    ui.add(egui::TextEdit::singleline(&mut self.catalog.rename_value).desired_width(300.0));
+                if is_rename || is_folder {
+                    let hint = if is_folder {
+                        self.t("catalog.folderName").to_string()
+                    } else {
+                        String::new()
+                    };
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.catalog.rename_value)
+                            .desired_width(300.0)
+                            .hint_text(hint),
+                    );
                     ui.horizontal(|ui| {
                         if ui.button(self.t("dialog.ok")).clicked() { commit = true; }
                         if ui.button(self.t("dialog.cancel")).clicked() { cancel = true; }
@@ -288,6 +339,9 @@ impl RustGisApp {
             let result = match action {
                 CatalogAction::Rename(path) => rename_catalog_item(&path, &self.catalog.rename_value),
                 CatalogAction::Delete(path) => delete_catalog_item(&path),
+                CatalogAction::NewFolder(parent) => {
+                    create_catalog_folder(&parent, &self.catalog.rename_value)
+                }
             };
             self.catalog.feedback = Some(match result {
                 Ok(()) => Ok(self.t("catalog.operationDone").to_string()),
@@ -500,7 +554,24 @@ fn is_shapefile_sidecar(path: &Path) -> bool {
 fn action_path(action: &CatalogAction) -> &Path {
     match action {
         CatalogAction::Rename(path) | CatalogAction::Delete(path) => path,
+        CatalogAction::NewFolder(parent) => parent,
     }
+}
+
+/// 在当前目录下新建文件夹（目录栏右键 → 新建 → 文件夹）。
+fn create_catalog_folder(parent: &Path, requested_name: &str) -> Result<(), String> {
+    let name = requested_name.trim();
+    if name.is_empty() {
+        return Err("文件夹名称不能为空".to_string());
+    }
+    if name.contains(['/', '\\']) {
+        return Err("只能输入文件夹名，不能包含路径分隔符".to_string());
+    }
+    let target = parent.join(name);
+    if target.exists() {
+        return Err(format!("已存在同名文件夹：{}", target.display()));
+    }
+    std::fs::create_dir(&target).map_err(|error| format!("{}：{error}", target.display()))
 }
 
 fn shapefile_base(path: &Path) -> Option<&str> {

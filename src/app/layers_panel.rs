@@ -4,6 +4,18 @@
 //! 下面是「图层」根节点，再往下是逐级缩进的图层树；每一行都由
 //! 「+/- 折叠框 → 勾选框 → 图例符号 → 名称」四段组成。
 //!
+//! 行主体（折叠框 / 勾选框以外的区域）支持**多选**，与文件管理器一致：
+//!
+//! | 操作 | 效果 |
+//! | --- | --- |
+//! | 左键单击 | 只选这一项 |
+//! | Ctrl + 左键单击 | 逐个加选 / 取消，可挑不连续的多项 |
+//! | Shift + 左键单击 | 选中上次锚点到这一项之间的连续一段 |
+//! | 右键「移除」或按 R | 移除整个选择集（右键在已选中的行上）或这一行 |
+//!
+//! 选择状态存在 [`crate::geo::LayerManager`] 里：集合末位是「主选择项」，
+//! 属性表、查找这类单选语义读它。
+//!
 //! 行布局是**像素级手算**的（缩进、列宽、命中区域），[`mod tests`] 里用无头
 //! `Context` 跑了完整的布局与拖拽时序回归，改动本文件后必须先过那些测试。
 //! 基础图标（加号 / 文件夹 / 折叠框 / 勾选框等）在 [`super::widgets`]。
@@ -367,6 +379,27 @@ impl RustGisApp {
         }
     }
 
+    /// 移除一批节点（多选时一次删掉整个选择集）。
+    ///
+    /// 栅格图层可能正在跑统计 / 建金字塔的后台任务，必须**先取消任务再摘节点**，
+    /// 否则后台线程会一直握着已删除图层的句柄；拖拽中的行被删掉时也要清拖拽状态，
+    /// 否则 `layers_panel` 会拿着一个不存在的 id 去结算落点。
+    fn remove_nodes(&mut self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            self.cancel_raster_job(*id);
+        }
+        for id in ids {
+            self.layers.remove(*id);
+        }
+        if self.layer_drag.is_some_and(|d| ids.contains(&d)) {
+            self.layer_drag = None;
+        }
+        self.dirty = true;
+    }
+
     /// 缩放至节点范围（右键「缩放至图层 / 缩放至组」，对标 QGIS 的 Zoom to Layer）。
     ///
     /// 这里只排队、不立刻改视图：右键菜单位于内容列表面板内，拿不到地图控件的
@@ -397,7 +430,7 @@ impl RustGisApp {
     /// 返回 `(拖拽仍在继续, 拖拽刚在本行结束)`——被拖行的 Response 才能报告这两件事，
     /// 而落点结算需要整棵树的 `metas`，所以只在这里取信号、由 `layers_panel` 统一结算。
     fn layer_row(&mut self, ui: &mut Ui, row: &Row, metas: &mut Vec<RowMeta>) -> (bool, bool) {
-        let selected = self.layers.selected_id() == Some(row.id);
+        let selected = self.layers.is_selected(row.id);
         let dragged = self.layer_drag == Some(row.id);
         let (row_rect, resp) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), ROW_H),
@@ -473,6 +506,11 @@ impl RustGisApp {
         });
 
         // ── 左键：折叠框切展开、勾选框切绘制、其余区域选中 ──
+        //
+        // 行主体（折叠框 / 勾选框以外）支持多选，与文件管理器的习惯一致：
+        //   · 普通点击   → 只选这一项；
+        //   · Ctrl + 点击 → 逐个加选 / 取消（可挑不连续的多项）；
+        //   · Shift+ 点击 → 选中上次锚点到这一项之间的连续一段。
         if resp.clicked() {
             let hit = |r: Rect| pointer.is_some_and(|p| r.contains(p));
             if row.has_children && hit(expander_rect) {
@@ -481,11 +519,23 @@ impl RustGisApp {
                 self.layers.set_visible(row.id, !row.visible);
                 self.dirty = true;
             } else {
-                self.layers.select(row.id);
+                // 修饰键在**按下那一刻**的状态：点击是按下即判定的，
+                // 松手时用户可能已经提前松开了 Ctrl / Shift。
+                let modifiers = ui.input(|i| i.modifiers);
+                if modifiers.shift {
+                    self.layers.select_range(row.id);
+                } else if modifiers.ctrl || modifiers.mac_cmd {
+                    self.layers.toggle_select(row.id);
+                } else {
+                    self.layers.select(row.id);
+                }
             }
         }
         if resp.dragged() {
-            self.layers.select(row.id);
+            // 拖已选中的行时不重排选择（多选拖动的起点），拖未选中的行才收敛到它。
+            if !self.layers.is_selected(row.id) {
+                self.layers.select(row.id);
+            }
             self.layer_drag = Some(row.id);
         }
         // 双击栅格图层：打开「图层属性」对话框（对标 ArcGIS 双击图层）。
@@ -520,6 +570,16 @@ impl RustGisApp {
             .node(id)
             .and_then(geo::LayerNode::layer)
             .is_some();
+        // 右键落在未选中的行上：先把选择收敛到这一行（与文件管理器一致），
+        // 菜单里的「移除」因此总是作用在用户看得见的那一批行上。
+        if resp.secondary_clicked() {
+            let hit = |r: Rect| pointer.is_some_and(|p| r.contains(p));
+            if !((row.has_children && hit(expander_rect)) || hit(checkbox_rect))
+                && !self.layers.is_selected(row.id)
+            {
+                self.layers.select(row.id);
+            }
+        }
         resp.context_menu(|ui| {
             let zoom_key = if is_group {
                 "layers.zoomToGroup"
@@ -586,15 +646,28 @@ impl RustGisApp {
                 ui.close_menu();
             }
             ui.separator();
-            if ui
-                .button(RichText::new(self.t("layers.remove")).color(style::DANGER))
+            // 「移除」的作用范围：右键落在已选中的行上 → 移除整个选择集（多选批量删）；
+            // 否则只移除这一行。菜单文案随之显示「移除 N 项」。
+            let targets: Vec<u64> = if self.layers.is_selected(id) {
+                self.layers.selection_ids().to_vec()
+            } else {
+                vec![id]
+            };
+            let remove_text = if targets.len() > 1 {
+                self.tf("layers.removeMany", &[&targets.len().to_string()])
+            } else {
+                self.t("layers.remove").to_string()
+            };
+            // 快捷键 R：菜单打开期间按 R 等同于点这一项（文案右侧显示 "R" 提示）。
+            let remove_pressed = ui
+                .add(
+                    egui::Button::new(RichText::new(remove_text).color(style::DANGER))
+                        .shortcut_text("R"),
+                )
                 .clicked()
-            {
-                // 栅格图层正在做统计 / 金字塔：先取消后台任务再移除节点。
-                self.cancel_raster_job(id);
-                self.layers.remove(id);
-                self.layer_drag = None;
-                self.dirty = true;
+                || ui.input(|i| i.key_pressed(egui::Key::R));
+            if remove_pressed {
+                self.remove_nodes(&targets);
                 ui.close_menu();
             }
         });
@@ -695,11 +768,61 @@ mod tests {
     /// 跑一帧内容列表（带指针事件）。命中测试基于上一遍注册的 widgets，
     /// 所以真正的交互前要先跑至少一帧布局。
     fn frame(ctx: &egui::Context, app: &mut RustGisApp, events: Vec<egui::Event>) {
+        frame_with(ctx, app, egui::Modifiers::default(), events);
+    }
+
+    /// 跑一帧内容列表，并指定这一帧按住的修饰键（Ctrl / Shift 多选靠它区分）。
+    fn frame_with(
+        ctx: &egui::Context,
+        app: &mut RustGisApp,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) {
         let mut input = headless_input();
+        // `InputState::modifiers` 每帧由 `RawInput` 覆盖，按住状态必须逐帧重发。
+        input.modifiers = modifiers;
         input.events = events;
         let _ = ctx.run(input, |ctx| {
             egui::SidePanel::left("layers_panel").show(ctx, |ui| app.layers_panel(ui));
         });
+    }
+
+    /// 在 `pos` 处按一次左键（移动 + 按下 + 松开），返回这一帧的事件序列。
+    fn click_events(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            press_event(pos),
+            release_event(pos),
+        ]
+    }
+
+    /// 探测前 `count` 行的屏幕位置：从上往下逐点点击，按点中后 `selected_id()`
+    /// 落在第几行记下坐标。
+    ///
+    /// 面板布局是像素级手算的，探测比硬编码 y 值稳健；返回的向量按下标对应
+    /// `panel_rows()` 的顺序（即自上而下）。
+    fn probe_row_positions(ctx: &egui::Context, app: &mut RustGisApp, count: usize) -> Vec<Pos2> {
+        let ids: Vec<u64> = app.layers.panel_rows().iter().map(|r| r.node.id()).collect();
+        app.layers.select(u64::MAX); // 先让选中失效，避免「没点中」被旧值误报
+        let mut found: Vec<Option<Pos2>> = vec![None; count];
+        for y in (30..=200).step_by(2) {
+            let pos = Pos2::new(60.0, y as f32);
+            frame(ctx, app, click_events(pos));
+            if let Some(hit) = app.layers.selected_id()
+                && let Some(i) = ids.iter().position(|id| *id == hit)
+                && i < count
+                && found[i].is_none()
+            {
+                found[i] = Some(pos);
+            }
+            if found.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        found
+            .into_iter()
+            .map(|f| f.expect("内容列表的行应能被点选到"))
+            .collect()
     }
 
     fn press_event(pos: Pos2) -> egui::Event {
@@ -796,6 +919,124 @@ mod tests {
         frame(&ctx, &mut app, vec![release_event(y_a)]);
         assert_eq!(app.layer_drag, None, "松开后拖拽状态应被清理");
         assert_eq!(toc_names(&app), vec!["b", "a"], "松开后 b 应移到 a 之前");
+    }
+
+    /// 三行的屏幕位置（自上而下）与对应 id。
+    fn three_rows(ctx: &egui::Context, app: &mut RustGisApp) -> (Vec<Pos2>, Vec<u64>) {
+        app.layers.add(sample_layer("a"));
+        app.layers.add(sample_layer("b"));
+        app.layers.add(sample_layer("c"));
+        frame(ctx, app, Vec::new()); // 先跑一帧布局，让行注册进 widgets
+        let ids: Vec<u64> = app.layers.panel_rows().iter().map(|r| r.node.id()).collect();
+        let pos = probe_row_positions(ctx, app, ids.len());
+        (pos, ids)
+    }
+
+    /// Ctrl + 左键：逐个加选 / 取消，可挑不连续的多项。
+    #[test]
+    fn ctrl_click_toggles_rows_in_panel() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::new(&ctx);
+        let (pos, ids) = three_rows(&ctx, &mut app);
+        let (first, last) = (ids[0], ids[2]);
+
+        app.layers.select(first);
+        frame_with(&ctx, &mut app, egui::Modifiers::CTRL, click_events(pos[2]));
+        assert_eq!(app.layers.selection_ids(), &[first, last][..]);
+
+        // 再点已选中的那一行 ⇒ 取消
+        frame_with(&ctx, &mut app, egui::Modifiers::CTRL, click_events(pos[2]));
+        assert_eq!(app.layers.selection_ids(), &[first][..]);
+
+        // 点中间那行 ⇒ 变成「首 + 中」两个不相邻的项
+        frame_with(&ctx, &mut app, egui::Modifiers::CTRL, click_events(pos[1]));
+        assert_eq!(app.layers.selection_ids(), &[first, ids[1]][..]);
+    }
+
+    /// Shift + 左键：选中锚点到点击行之间的连续一段。
+    #[test]
+    fn shift_click_selects_range_in_panel() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::new(&ctx);
+        let (pos, ids) = three_rows(&ctx, &mut app);
+
+        app.layers.select(ids[0]); // 锚点 = 第一行
+        frame_with(&ctx, &mut app, egui::Modifiers::SHIFT, click_events(pos[2]));
+        assert_eq!(app.layers.selection_ids(), &ids[..], "首行到末行整段选中");
+
+        // 锚点不随这次点击移动：再 Shift 点中间那行 ⇒ 收敛回首 + 中
+        frame_with(&ctx, &mut app, egui::Modifiers::SHIFT, click_events(pos[1]));
+        assert_eq!(app.layers.selection_ids(), &ids[0..2]);
+    }
+
+    /// 右键菜单打开期间按 R ⇒ 移除选中项（「移除」的快捷键）。
+    #[test]
+    fn r_shortcut_removes_selected_in_context_menu() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::new(&ctx);
+        let (pos, ids) = three_rows(&ctx, &mut app);
+        let target = ids[0];
+
+        // 右键点第一行：菜单打开，且选择收敛到这一行
+        let secondary = |pressed: bool| egui::Event::PointerButton {
+            pos: pos[0],
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos[0]),
+                secondary(true),
+                secondary(false),
+            ],
+        );
+        assert_eq!(
+            app.layers.selected_id(),
+            Some(target),
+            "右键未选中的行应把选择收敛到它"
+        );
+
+        // 菜单仍在打开的下一帧：按 R
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::R,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(
+            app.layers.node(target).is_none(),
+            "菜单里按 R 应移除选中图层"
+        );
+        assert_eq!(app.layers.panel_rows().len(), 2);
+        assert!(app.dirty, "移除应把工程标脏");
+    }
+
+    /// 多选后右键「移除」一次删掉整个选择集。
+    #[test]
+    fn remove_applies_to_the_whole_selection() {
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::new(&ctx);
+        let (_, ids) = three_rows(&ctx, &mut app);
+
+        app.layers.select(ids[0]);
+        app.layers.toggle_select(ids[2]);
+        assert_eq!(app.layers.selection_ids(), &[ids[0], ids[2]][..]);
+
+        app.remove_nodes(&[ids[0], ids[2]]);
+        let left: Vec<u64> = app.layers.panel_rows().iter().map(|r| r.node.id()).collect();
+        assert_eq!(left, vec![ids[1]], "只留下没被选中的那一行");
+        assert!(
+            app.layers.selection_ids().is_empty(),
+            "被选中的两行都删掉了，选择集应清空"
+        );
     }
 
     /// 无头跑一帧中央地图面板（视图适配逻辑所在的位置）。

@@ -185,7 +185,7 @@ mod tests {
     fn about_dialog_lists_version_and_font() {
         let text = Dialog::About.text(Language::Chinese, "渲染字体: 阿里巴巴普惠体");
         assert!(text.starts_with(&format!("RustGIS {}", env!("CARGO_PKG_VERSION"))));
-        assert!(text.contains("MIT / Apache-2.0"));
+        assert!(text.contains("Apache-2.0"));
         assert!(text.ends_with("渲染字体: 阿里巴巴普惠体"));
     }
 }

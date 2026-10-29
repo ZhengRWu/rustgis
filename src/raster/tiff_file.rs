@@ -391,7 +391,26 @@ impl TiffFile {
         };
         let (_, _, width, height) = level.block_span(block);
         let samples = if level.planar { 1 } else { level.samples };
-        let mut data = decoding_to_f32(self.decoder.read_chunk(chunk)?);
+        let mut data = match self.decoder.read_chunk(chunk) {
+            Ok(result) => decoding_to_f32(result),
+            // LZW 回退：tiff crate 对边缘块走「逐行小缓冲」读取路径，个别 LZW 流
+            // 会在最后一小段读取时触发 weezl 的 NoProgress 误报（把已解出的字节
+            // 一并丢弃，报 "no lzw end code found"，而流本身完整、带结束码）。
+            // 回退路径用 weezl 直接整段解码，再自行裁剪与应用预测器。
+            Err(err) if self.info.compression == CompressionKind::Lzw => {
+                self.read_chunk_lzw_fallback(level, chunk)
+                    .map_err(|fallback| {
+                        // 回退也失败：保留原始错误（更贴近根因），并附上回退细节。
+                        match fallback {
+                            RasterError::Io(msg) => {
+                                RasterError::Io(format!("{msg}（原始错误：{err}）"))
+                            }
+                            other => other,
+                        }
+                    })?
+            }
+            Err(err) => return Err(err.into()),
+        };
         let expected = width as usize * height as usize * samples as usize;
         if data.len() < expected {
             return Err(RasterError::Corrupt(format!(
@@ -410,6 +429,118 @@ impl TiffFile {
             },
         );
         Ok(())
+    }
+
+    /// LZW 块的容错解码：绕过 tiff crate 的流式包装，直接按块偏移 / 字节计数
+    /// 取出压缩字节，用 weezl 一次性解码到全块尺寸，再裁掉瓦片边缘填充。
+    ///
+    /// 与 `read_chunk` 的输出等价（含字节序修正与水平差分预测器）。
+    fn read_chunk_lzw_fallback(
+        &mut self,
+        level: &LevelLayout,
+        chunk: u32,
+    ) -> Result<Vec<f32>, RasterError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let (offsets_tag, counts_tag) = match level.layout {
+            BlockLayout::Tiles => (Tag::TileOffsets, Tag::TileByteCounts),
+            _ => (Tag::StripOffsets, Tag::StripByteCounts),
+        };
+        let offsets: Vec<u64> = self
+            .decoder
+            .find_tag_unsigned_vec(offsets_tag)?
+            .ok_or_else(|| RasterError::Corrupt("缺少块偏移表".into()))?;
+        let counts: Vec<u64> = self
+            .decoder
+            .find_tag_unsigned_vec(counts_tag)?
+            .ok_or_else(|| RasterError::Corrupt("缺少块字节计数表".into()))?;
+        let index = chunk as usize;
+        let (offset, count) = match (offsets.get(index), counts.get(index)) {
+            (Some(offset), Some(count)) => (*offset, *count),
+            _ => {
+                return Err(RasterError::Corrupt(format!(
+                    "块 #{chunk} 的偏移 / 字节计数超出表范围"
+                )))
+            }
+        };
+        let bytes_per_sample = usize::try_from(self.info.sample_type.bytes()).unwrap_or(0);
+        // 平面（Planar）块每样本一个平面；交错块含全部采样。
+        let samples_in_chunk = usize::from(if level.planar { 1 } else { level.samples });
+        let bps = usize::from(self.info.bits_per_sample);
+        if bps != bytes_per_sample * 8 {
+            return Err(RasterError::Unsupported(format!(
+                "LZW 回退不支持 {bps} 位采样（{}）",
+                self.info.sample_type.label()
+            )));
+        }
+
+        // 取出原始压缩字节（`read_chunk` 每次都会先定位，所以这里移动读位置是安全的）。
+        let reader = self.decoder.inner();
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|err| RasterError::Io(err.to_string()))?;
+        let mut compressed = vec![0u8; usize::try_from(count).unwrap_or(0)];
+        reader
+            .read_exact(&mut compressed)
+            .map_err(|err| RasterError::Io(err.to_string()))?;
+
+        // 整段一次性解码：不经过 tiff 的逐行小缓冲包装。
+        let mut decoder = weezl::decode::Configuration::with_tiff_size_switch(
+            weezl::BitOrder::Msb,
+            8,
+        )
+        .build();
+        let mut decoded = decoder
+            .decode(&compressed)
+            .map_err(|err| RasterError::Io(format!("LZW 回退解码失败：{err}")))?;
+
+        // 全块布局（边缘瓦片在 TIFF 里按完整尺寸编码，行尾带填充）。
+        let full_row_bytes = usize::try_from(level.block_width).unwrap_or(0)
+            * samples_in_chunk
+            * bytes_per_sample;
+        let (_, _, width, height) = level.block_span(chunk % level.blocks_per_plane());
+        // 实际数据行宽（去掉行尾填充）。
+        let data_row_bytes = usize::try_from(width).unwrap_or(0)
+            * samples_in_chunk
+            * bytes_per_sample;
+        if full_row_bytes == 0 || data_row_bytes == 0 {
+            return Err(RasterError::Corrupt(format!("块 #{chunk} 布局异常")));
+        }
+
+        // 水平差分预测器（Predictor = 2）：先做字节序修正，再逐行还原差分。
+        let big_endian = self.decoder.byte_order() == tiff::tags::ByteOrder::BigEndian;
+        if bps > 8 && big_endian {
+            for chunk_bytes in decoded.chunks_exact_mut(bps / 8) {
+                chunk_bytes.reverse();
+            }
+        }
+        let predictor = self
+            .decoder
+            .find_tag_unsigned::<u16>(Tag::Predictor)
+            .ok()
+            .flatten()
+            .unwrap_or(1);
+        if predictor == 2 {
+            apply_horizontal_predictor(&mut decoded, full_row_bytes, bps, samples_in_chunk)?;
+        }
+
+        // 裁掉行尾填充：从全块行布局里抽取每行的前 data_row_bytes 字节。
+        let mut trimmed = Vec::with_capacity(data_row_bytes * usize::try_from(height).unwrap_or(0));
+        for row in 0..usize::try_from(height).unwrap_or(0) {
+            let start = row * full_row_bytes;
+            let Some(src) = decoded.get(start..start + data_row_bytes) else {
+                return Err(RasterError::Corrupt(format!(
+                    "块 #{chunk} LZW 回退解码得到 {} 字节，少于裁剪所需的 {} 字节",
+                    decoded.len(),
+                    start + data_row_bytes
+                )));
+            };
+            trimmed.extend_from_slice(src);
+        }
+
+        // 字节 → f32（与 decoding_to_f32 的映射一致）。
+        let plane = bytes_to_f32(&trimmed, self.info.sample_type);
+        Ok(plane)
     }
 }
 
@@ -501,6 +632,112 @@ fn decoding_to_f32(result: DecodingResult) -> Vec<f32> {
         DecodingResult::F16(values) => values.into_iter().map(f32::from).collect(),
         DecodingResult::F32(values) => values,
         DecodingResult::F64(values) => values.into_iter().map(|v| v as f32).collect(),
+    }
+}
+
+/// 水平差分预测器还原（Predictor = 2，字节序已修正）。
+///
+/// 逐行按「同波段前一个采样」还原差分：`v[i] += v[i - samples]`（升序，
+/// `v[i - samples]` 已是还原后的值，与 libtiff 行为一致）。
+fn apply_horizontal_predictor(
+    data: &mut [u8],
+    row_bytes: usize,
+    bits_per_sample: usize,
+    samples: usize,
+) -> Result<(), RasterError> {
+    if row_bytes == 0 || data.len() % row_bytes != 0 {
+        return Err(RasterError::Corrupt(
+            "预测器还原时数据长度与行宽不对齐".into(),
+        ));
+    }
+    match bits_per_sample {
+        8 => {
+            for row in data.chunks_exact_mut(row_bytes) {
+                for i in samples..row.len() {
+                    row[i] = row[i].wrapping_add(row[i - samples]);
+                }
+            }
+        }
+        16 => {
+            for row in data.chunks_exact_mut(row_bytes) {
+                let values: &mut [u16] = bytemuck_cast_u16(row);
+                for i in samples..values.len() {
+                    values[i] = values[i].wrapping_add(values[i - samples]);
+                }
+            }
+        }
+        32 => {
+            for row in data.chunks_exact_mut(row_bytes) {
+                let values: &mut [u32] = bytemuck_cast_u32(row);
+                for i in samples..values.len() {
+                    values[i] = values[i].wrapping_add(values[i - samples]);
+                }
+            }
+        }
+        other => {
+            return Err(RasterError::Unsupported(format!(
+                "LZW 回退不支持 {other} 位采样的差分预测器"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 把字节行安全地按 u16 视图访问（行宽保证 2 字节对齐）。
+fn bytemuck_cast_u16(row: &mut [u8]) -> &mut [u16] {
+    debug_assert!(row.len() % 2 == 0);
+    let ptr = row.as_mut_ptr().cast::<u16>();
+    // SAFETY：长度为偶数且 u16 对齐要求（2）不高于其来源切片的自然对齐约束，
+    // 这里行宽来自「采样数 × 2 字节」，必然满足。
+    unsafe { std::slice::from_raw_parts_mut(ptr, row.len() / 2) }
+}
+
+/// 把字节行安全地按 u32 视图访问（行宽保证 4 字节对齐）。
+fn bytemuck_cast_u32(row: &mut [u8]) -> &mut [u32] {
+    debug_assert!(row.len() % 4 == 0);
+    let ptr = row.as_mut_ptr().cast::<u32>();
+    // SAFETY：长度为 4 的倍数；u32 对齐要求（4）不高于 u8 切片起始地址的
+    // 分配对齐（块缓冲按 Vec<u8> 分配，实际对齐 ≥ 4），行宽按整采样划分。
+    unsafe { std::slice::from_raw_parts_mut(ptr, row.len() / 4) }
+}
+
+/// 把原始字节按采样类型转成 f32 平面（映射与 [`decoding_to_f32`] 一致）。
+fn bytes_to_f32(bytes: &[u8], sample_type: SampleType) -> Vec<f32> {
+    match sample_type {
+        SampleType::U8 => bytes.iter().map(|b| f32::from(*b)).collect(),
+        SampleType::I8 => bytes.iter().map(|b| f32::from(*b as i8)).collect(),
+        SampleType::U16 => bytes
+            .chunks_exact(2)
+            .map(|c| f32::from(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        SampleType::I16 => bytes
+            .chunks_exact(2)
+            .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        SampleType::U32 => bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect(),
+        SampleType::I32 => bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect(),
+        SampleType::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        SampleType::U64 => bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        SampleType::I64 => bytes
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        SampleType::F64 => bytes
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
     }
 }
 

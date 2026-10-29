@@ -2,7 +2,10 @@
 use super::{RustGisApp, Status};
 use crate::{
     geo::LayerNode,
-    raster::extract_mask::{self, MaskSource},
+    raster::{
+        extract_mask::{self, MaskSource},
+        mosaic::{self, MosaicOperator, MosaicRequest},
+    },
     style,
 };
 use egui::{Context, RichText, Ui};
@@ -30,8 +33,14 @@ struct ToolEntry {
     action: &'static str,
     keywords: &'static str,
 }
-const CATEGORIES: [&str; 4] = ["全部工具", "叠加分析", "数据管理", "栅格提取"];
-const TOOLS: [ToolEntry; 7] = [
+const CATEGORIES: [&str; 5] = [
+    "全部工具",
+    "叠加分析",
+    "数据管理",
+    "栅格提取",
+    "栅格数据管理",
+];
+const TOOLS: [ToolEntry; 8] = [
     ToolEntry {
         name: "裁剪",
         description: "以面要素为边界，保留输入要素在边界内的部分。",
@@ -81,6 +90,13 @@ const TOOLS: [ToolEntry; 7] = [
         action: "raster.extractMask",
         keywords: "extract by mask raster nodata 掩膜 提取 栅格",
     },
+    ToolEntry {
+        name: "镶嵌至新栅格",
+        description: "将多个栅格合并为一个新的 GeoTIFF，并可选择重叠像元的合成方式。",
+        category: 4,
+        action: "raster.mosaicToNewRaster",
+        keywords: "mosaic raster merge combine 镶嵌 合并 栅格",
+    },
 ];
 
 fn matches(tool: &ToolEntry, category: usize, query: &str) -> bool {
@@ -108,6 +124,26 @@ pub(super) struct MaskJob {
     rx: Receiver<Result<PathBuf, String>>,
     cancel: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
+}
+
+#[derive(Default)]
+pub(super) struct MosaicDialog {
+    pub open: bool,
+    inputs: Vec<u64>,
+    output: String,
+    operator: usize,
+    message: Option<String>,
+    browse: Option<Receiver<Option<PathBuf>>>,
+}
+pub(super) struct MosaicJob {
+    rx: Receiver<Result<PathBuf, String>>,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<AtomicU32>,
+}
+impl Drop for MosaicJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 impl Drop for MaskJob {
     fn drop(&mut self) {
@@ -455,6 +491,139 @@ impl RustGisApp {
             }
         }
     }
+
+    pub(super) fn show_mosaic_dialog(&mut self, ctx: &Context) {
+        if !self.mosaic_dialog.open {
+            return;
+        }
+        let mut state = std::mem::take(&mut self.mosaic_dialog);
+        let mut list = Vec::new();
+        choices(self.layers.roots(), &mut list);
+        list.retain(|c| c.raster);
+        state.inputs.retain(|id| list.iter().any(|c| c.id == *id));
+        if let Some(rx) = &state.browse {
+            match rx.try_recv() {
+                Ok(p) => {
+                    if let Some(p) = p {
+                        state.output = p.display().to_string();
+                    }
+                    state.browse = None;
+                }
+                Err(TryRecvError::Disconnected) => state.browse = None,
+                Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
+            }
+        }
+        let busy = self.mosaic_job.is_some();
+        let ready = self.project_idle() && self.raster_stage.is_none();
+        let mut run = false;
+        let mut open = true;
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("rustgis_mosaic_to_new_raster"),egui::ViewportBuilder::default().with_title("镶嵌至新栅格 — RustGIS").with_inner_size([650.,560.]).with_min_inner_size([500.,440.]),|ctx,class|{
+            let mut content=|ui:&mut Ui|{egui::ScrollArea::vertical().show(ui,|ui|{
+                ui.heading("镶嵌至新栅格");ui.label("将多个栅格合成为一个新的 GeoTIFF。");ui.add_space(10.);ui.separator();
+                ui.add_enabled_ui(!busy,|ui|{
+                    ui.label("输入栅格（勾选多个，顺序用于 FIRST / LAST）");
+                    egui::ScrollArea::vertical().max_height(150.).show(ui,|ui|{for c in &list{let mut checked=state.inputs.contains(&c.id);if ui.checkbox(&mut checked,&c.name).changed(){if checked{state.inputs.push(c.id)}else{state.inputs.retain(|id|*id!=c.id)}}}});
+                    ui.add_space(8.);ui.label("镶嵌运算符");egui::ComboBox::from_id_salt("mosaic_operator").selected_text(MosaicOperator::ALL.get(state.operator).copied().unwrap_or(MosaicOperator::First).label()).show_ui(ui,|ui|for (i,op) in MosaicOperator::ALL.iter().enumerate(){ui.selectable_value(&mut state.operator,i,op.label());});
+                    ui.add_space(8.);ui.label("输出 GeoTIFF");ui.horizontal(|ui|{ui.add(egui::TextEdit::singleline(&mut state.output).hint_text("选择新的 .tif 文件路径").desired_width((ui.available_width()-65.).max(100.)));if ui.add_enabled(state.browse.is_none(),egui::Button::new("浏览…")).clicked(){let (tx,rx)=mpsc::channel();state.browse=Some(rx);std::thread::spawn(move||{let p=rfd::FileDialog::new().set_title("镶嵌结果另存为").set_file_name("mosaic.tif").add_filter("GeoTIFF",&["tif","tiff"]).save_file();let _=tx.send(p);});}});
+                });
+                ui.add_space(12.);egui::Frame::new().fill(style::SOFT_BG).inner_margin(10).show(ui,|ui|{ui.label(RichText::new("处理规则").strong());ui.label("• 输出坐标系、像元大小和网格对齐采用第一个输入栅格；其他输入按最近邻方式采样并转换到该坐标系。");ui.label("• 输出波段数取所有输入中的最大值，输出类型为 Float32 GeoTIFF；缺失波段及 NoData 像元写为 NoData。");ui.label("• 支持 FIRST、LAST、BLEND、MINIMUM、MAXIMUM、MEAN 和 SUM；BLEND 按影像边缘距离加权。");ui.label("• 暂不支持调色板映射。输出使用新文件名，不覆盖现有文件；完成后自动加入地图。");});
+                ui.add_space(10.);if let Some(m)=&state.message{ui.label(m);}if let Some(job)=&self.mosaic_job{ui.add(egui::ProgressBar::new(job.progress.load(Ordering::Relaxed) as f32/1000.).show_percentage());if ui.add_enabled(!job.cancel.load(Ordering::Relaxed),egui::Button::new("取消处理")).clicked(){job.cancel.store(true,Ordering::Relaxed);state.message=Some("正在取消…".into());}}else{ui.horizontal(|ui|{if ui.add_enabled(ready&&!state.inputs.is_empty()&&!state.output.trim().is_empty()&&state.browse.is_none(),egui::Button::new("运行").fill(style::ACCENT_ACTIVE_BG)).clicked(){run=true;}if !ready{ui.label("请等待当前导入或工程操作完成。");}});}
+            });};
+            if class==egui::ViewportClass::Embedded{egui::Window::new("镶嵌至新栅格").open(&mut open).default_size([650.,560.]).show(ctx,&mut content);}else{egui::CentralPanel::default().show(ctx,&mut content);if ctx.input(|i|i.viewport().close_requested()){open=false;}}
+        });
+        state.open = open;
+        self.mosaic_dialog = state;
+        if run {
+            self.start_mosaic_job();
+        }
+    }
+
+    fn start_mosaic_job(&mut self) {
+        let prepared = (|| -> Result<_, String> {
+            let inputs = self
+                .mosaic_dialog
+                .inputs
+                .iter()
+                .filter_map(|id| {
+                    self.layers
+                        .node(*id)
+                        .and_then(LayerNode::raster)
+                        .map(|r| r.path.clone())
+                })
+                .collect::<Vec<_>>();
+            if inputs.is_empty() {
+                return Err("请选择至少一个输入栅格。".into());
+            }
+            let output = PathBuf::from(self.mosaic_dialog.output.trim());
+            if !output
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("tif") || s.eq_ignore_ascii_case("tiff"))
+            {
+                return Err("输出扩展名应为 .tif 或 .tiff。".into());
+            }
+            if output.exists() {
+                return Err("输出文件已存在，请选择新的文件名。".into());
+            }
+            Ok((inputs, output))
+        })();
+        match prepared {
+            Err(e) => self.mosaic_dialog.message = Some(e),
+            Ok((inputs, output)) => {
+                let (tx, rx) = mpsc::channel();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let progress = Arc::new(AtomicU32::new(0));
+                let c = cancel.clone();
+                let p = progress.clone();
+                let operator = MosaicOperator::ALL
+                    .get(self.mosaic_dialog.operator)
+                    .copied()
+                    .unwrap_or(MosaicOperator::First);
+                let out = output.clone();
+                std::thread::spawn(move || {
+                    let result = mosaic::mosaic(MosaicRequest { inputs, output }, operator, &c, &p)
+                        .map(|()| out);
+                    let _ = tx.send(result);
+                });
+                self.mosaic_job = Some(MosaicJob {
+                    rx,
+                    cancel,
+                    progress,
+                });
+                self.mosaic_dialog.message =
+                    Some("正在镶嵌，可继续浏览地图；关闭此窗口不会中止处理。".into());
+            }
+        }
+    }
+
+    pub(super) fn poll_mosaic_job(&mut self, ctx: &Context) {
+        if self.mosaic_job.is_some() && self.raster_stage.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
+        let Some(job) = self.mosaic_job.take() else {
+            return;
+        };
+        match job.rx.try_recv() {
+            Ok(Ok(path)) => {
+                self.mosaic_dialog.message = Some(format!("镶嵌完成：{}", path.display()));
+                self.start_raster_open(path);
+            }
+            Ok(Err(e)) => {
+                self.status = Status::Message(e.clone());
+                self.mosaic_dialog.message = Some(e);
+                self.mosaic_dialog.open = true;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.mosaic_dialog.message = Some("处理线程意外结束，请重试。".into());
+                self.mosaic_dialog.open = true;
+            }
+            Err(TryRecvError::Empty) => {
+                self.mosaic_job = Some(job);
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -464,7 +633,15 @@ mod tests {
     fn toolbox_search_matches_names_descriptions_and_english_keywords() {
         assert_eq!(TOOLS.iter().filter(|t| matches(t, 0, "mask")).count(), 1);
         assert_eq!(TOOLS.iter().filter(|t| matches(t, 1, "mask")).count(), 0);
-        assert_eq!(TOOLS.iter().filter(|t| matches(t, 0, "合并")).count(), 1);
+        // 「合并」同时命中矢量合并与「镶嵌至新栅格」（描述 / 关键词都含"合并"）。
+        let merged: Vec<_> = TOOLS
+            .iter()
+            .filter(|t| matches(t, 0, "合并"))
+            .map(|t| t.action)
+            .collect();
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains(&"overlay.merge.menu"));
+        assert!(merged.contains(&"raster.mosaicToNewRaster"));
         assert!(TOOLS.iter().any(|t| matches(t, 3, "栅格 NoData")));
         assert_eq!(
             TOOLS

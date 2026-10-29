@@ -95,6 +95,10 @@ pub static MENUS: &[MenuDef] = &[
             Entry::Item("layer.addRaster"),
             Entry::Item("layer.addSafe"),
             Entry::Separator,
+            // 新建矢量图层（v0.5）：与目录栏右键「新建 → 矢量」同一入口，
+            // 建完直接进入数字化绘制。
+            Entry::Item("layer.newVector"),
+            Entry::Separator,
             Entry::Item("insert.text"),
             Entry::Item("insert.picture"),
             Entry::Item("insert.grid"),

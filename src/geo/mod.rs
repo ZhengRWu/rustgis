@@ -15,6 +15,9 @@ pub mod overlay;
 
 pub mod proj;
 
+/// 矢量落盘（v0.5：新建矢量 → Shapefile / GeoJSON 写盘，见模块注释）。
+pub mod vector_file;
+
 use proj::display_aabb;
 
 use std::path::Path;
@@ -116,6 +119,31 @@ impl ProjectionInfo {
         Self {
             model: ProjectionModel::Unknown,
             crs: CrsId::None,
+        }
+    }
+
+    /// WGS 84 经纬度（EPSG:4326）：GeoJSON 的默认坐标系，也是新建矢量时
+    /// 「跟随工程」之外最常用的一项（与 QGIS 新建图层的默认 CRS 一致）。
+    pub fn wgs84() -> Self {
+        Self {
+            model: ProjectionModel::Geographic,
+            crs: CrsId::Epsg(4326),
+        }
+    }
+
+    /// CGCS2000 经纬度（EPSG:4490）。
+    pub fn cgcs2000() -> Self {
+        Self {
+            model: ProjectionModel::Geographic,
+            crs: CrsId::Epsg(4490),
+        }
+    }
+
+    /// Web 墨卡托（EPSG:3857）。
+    pub fn web_mercator() -> Self {
+        Self {
+            model: ProjectionModel::Projected,
+            crs: CrsId::Epsg(3857),
         }
     }
 }
@@ -811,11 +839,18 @@ pub struct PanelRow<'a> {
 }
 
 /// 图层集合（内容列表树）。`roots[0]` 是面板最顶层，也是最后绘制的。
+///
+/// 选择是**多选**的（Ctrl / Shift + 左键，见 [`LayerManager::toggle_select`] 与
+/// [`LayerManager::select_range`]）：`selection` 按点击顺序保存全部选中 id，
+/// **最后一个元素是「主选择项」**——属性表、查找结果定位这类单选语义读它。
 #[derive(Default)]
 pub struct LayerManager {
     roots: Vec<LayerNode>,
     next_id: u64,
-    selected: Option<u64>,
+    /// 多选集合（有序）；空表示无选中，末位为主选择项。
+    selection: Vec<u64>,
+    /// Shift 连续选择的锚点（上一次普通点击 / Ctrl 点击的项）。
+    anchor: Option<u64>,
     /// 会改变渲染结果的变更计数（渲染缓存据此判断是否需要重建）。
     revision: u64,
 }
@@ -829,6 +864,13 @@ impl LayerManager {
     /// 渲染缓存版本号：只要图层集合 / 可见性 / 顺序 / 几何发生改变就会自增。
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// 就地改了某个图层的几何 / 属性（数字化加要素）后告诉渲染缓存重建。
+    ///
+    /// 渲染器只认 `revision`：不走这里，画完的要素要等下次增删图层才出现。
+    pub fn touch(&mut self) {
+        self.bump();
     }
 
     fn bump(&mut self) {
@@ -851,9 +893,25 @@ impl LayerManager {
         for node in roots.iter_mut() {
             renumber(node, &mut self.next_id);
         }
-        self.roots = roots;
-        self.selected = self.roots.first().map(LayerNode::id);
+        // 加载进来的树重新编过号，旧选择（包括锚点）一律作废，退回首个顶层节点。
+        self.selection = self.roots.first().map(LayerNode::id).into_iter().collect();
+        self.anchor = self.selection.last().copied();
         self.bump();
+    }
+
+    /// 把选择收缩成单个节点，并把它设为 Shift 连续选择的锚点。
+    fn select_only(&mut self, id: u64) {
+        self.selection = vec![id];
+        self.anchor = Some(id);
+    }
+
+    /// 丢弃已经不在树里的选中项与锚点（删除节点后调用）。
+    fn prune_selection(&mut self) {
+        let roots = &self.roots;
+        self.selection.retain(|id| find_node(roots, *id).is_some());
+        if self.anchor.is_some_and(|a| find_node(roots, a).is_none()) {
+            self.anchor = self.selection.last().copied();
+        }
     }
 
     fn take_id(&mut self) -> u64 {
@@ -864,7 +922,7 @@ impl LayerManager {
 
     /// 新节点的落点：当前选中项是组（且该组仍存在）→ 插到组内最上层；否则插到顶层最上层。
     fn insertion_point(&self) -> (Option<u64>, usize) {
-        if let Some(id) = self.selected
+        if let Some(id) = self.selected_id()
             && self.node(id).is_some_and(LayerNode::is_group)
         {
             return (Some(id), 0);
@@ -877,7 +935,7 @@ impl LayerManager {
         layer.id = self.take_id();
         let id = layer.id;
         let (parent, index) = self.insertion_point();
-        self.selected = Some(id);
+        self.select_only(id);
         let _ = insert_node(&mut self.roots, parent, index, LayerNode::Layer(layer));
         self.bump();
         id
@@ -888,7 +946,7 @@ impl LayerManager {
         layer.id = self.take_id();
         let id = layer.id;
         let (parent, index) = self.insertion_point();
-        self.selected = Some(id);
+        self.select_only(id);
         let _ = insert_node(&mut self.roots, parent, index, LayerNode::Raster(layer));
         self.bump();
         id
@@ -905,7 +963,7 @@ impl LayerManager {
             expanded: true,
             children: Vec::new(),
         };
-        self.selected = Some(id);
+        self.select_only(id);
         let _ = insert_node(&mut self.roots, parent, index, LayerNode::Group(group));
         self.bump();
         id
@@ -951,12 +1009,65 @@ impl LayerManager {
         out
     }
 
+    /// 主选择项（多选集合的末位）；无选中时返回 `None`。
     pub fn selected_id(&self) -> Option<u64> {
-        self.selected
+        self.selection.last().copied()
     }
 
+    /// 单选：清空其余选择，只留下 `id`。
     pub fn select(&mut self, id: u64) {
-        self.selected = Some(id);
+        self.select_only(id);
+    }
+
+    /// 该节点是否处于选择集合中。
+    pub fn is_selected(&self, id: u64) -> bool {
+        self.selection.contains(&id)
+    }
+
+    /// 完整的多选集合（有序）；末位是主选择项。
+    pub fn selection_ids(&self) -> &[u64] {
+        &self.selection
+    }
+
+    /// Ctrl + 左键：已选中的移出集合，未选中的加入集合并成为主选择项。
+    ///
+    /// 移出后主选择项自动退回集合里剩下的最后一项（与文件管理器一致）。
+    /// 无论加还是减，被点的这一项都会成为下一次 Shift 连续选择的锚点。
+    pub fn toggle_select(&mut self, id: u64) {
+        self.anchor = Some(id);
+        match self.selection.iter().position(|s| *s == id) {
+            Some(pos) => {
+                self.selection.remove(pos);
+            }
+            None => self.selection.push(id),
+        }
+    }
+
+    /// Shift + 左键：选中锚点到 `id` 之间连续的一段（按内容列表可见行顺序）。
+    ///
+    /// 锚点缺失（例如刚加载工程）或已不在可见行里（所在组被折叠）时退回单选。
+    /// 锚点本身不被这次点击改变：按住 Shift 反复点不同位置可以连续调整范围。
+    pub fn select_range(&mut self, id: u64) {
+        let Some(anchor) = self.anchor else {
+            self.select_only(id);
+            return;
+        };
+        if anchor == id {
+            self.select_only(id);
+            return;
+        }
+        let order: Vec<u64> = self.panel_rows().iter().map(|r| r.node.id()).collect();
+        // 终点不可能缺失：点击只能落在可见行上。
+        let Some(to) = order.iter().position(|x| *x == id) else {
+            return;
+        };
+        // 锚点已不可见（所在组被折叠）⇒ 无从界定范围，退回单选。
+        let Some(from) = order.iter().position(|x| *x == anchor) else {
+            self.select_only(id);
+            return;
+        };
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        self.selection = order[lo..=hi].to_vec();
     }
 
     /// 按 id 取节点（图层与组共用同一 id 空间）。
@@ -987,12 +1098,8 @@ impl LayerManager {
 
     pub fn remove(&mut self, id: u64) {
         if take_node(&mut self.roots, id).is_some() {
-            // 选中的节点可能正是被删掉的节点，或其子孙。
-            if let Some(sel) = self.selected
-                && find_node(&self.roots, sel).is_none()
-            {
-                self.selected = None;
-            }
+            // 被删的可能是选中项之一，也可能是某个选中项的祖先（子树整体消失）。
+            self.prune_selection();
             self.bump();
         }
     }
@@ -2320,6 +2427,108 @@ mod tests {
 
         // 只剩一个根节点：全局展开/折叠不应 panic
         mgr.set_all_expanded(false);
+    }
+
+    // -----------------------------------------------------------------------
+    // 多选（Ctrl 逐个加选 / Shift 连续范围）
+    // -----------------------------------------------------------------------
+
+    /// 内容列表自上而下的 id 顺序（新图层插在最上层，故与添加顺序相反）。
+    fn row_ids(mgr: &LayerManager) -> Vec<u64> {
+        mgr.panel_rows().iter().map(|r| r.node.id()).collect()
+    }
+
+    /// Ctrl + 左键：点未选中的加入、点已选中的移出，可挑不连续的多项。
+    #[test]
+    fn ctrl_click_toggles_individual_items() {
+        let mut mgr = LayerManager::default();
+        for name in ["a", "b", "c", "d"] {
+            mgr.add(boxed_layer(name, 0.0));
+        }
+        let order = row_ids(&mgr);
+        let (a, b, d) = (order[3], order[2], order[0]);
+
+        mgr.select(b);
+        assert_eq!(mgr.selection_ids(), &[b][..]);
+
+        mgr.toggle_select(d); // 加选一个不相邻的项
+        assert_eq!(mgr.selection_ids(), &[b, d][..]);
+        assert_eq!(mgr.selected_id(), Some(d), "最后点中的项成为主选择项");
+
+        mgr.toggle_select(b); // 再点已选中的项 ⇒ 取消
+        assert_eq!(mgr.selection_ids(), &[d][..]);
+        assert_eq!(mgr.selected_id(), Some(d), "取消后主选择项退回剩下的一项");
+
+        assert!(mgr.is_selected(d));
+        assert!(!mgr.is_selected(a));
+    }
+
+    /// Shift + 左键：选中锚点到点击项之间的连续一段；锚点不随这次点击移动。
+    #[test]
+    fn shift_click_selects_continuous_range() {
+        let mut mgr = LayerManager::default();
+        for name in ["a", "b", "c", "d"] {
+            mgr.add(boxed_layer(name, 0.0));
+        }
+        let order = row_ids(&mgr);
+        let (a, b, c, d) = (order[3], order[2], order[1], order[0]);
+
+        mgr.select(b); // 锚点 = b
+        mgr.select_range(d); // 向下选到 d：b, c, d
+        assert_eq!(mgr.selection_ids(), &[b, c, d][..]);
+
+        mgr.select_range(a); // 锚点仍是 b，反向只选回 a, b
+        assert_eq!(mgr.selection_ids(), &[a, b][..]);
+
+        mgr.select_range(b); // 起终点相同 ⇒ 退回单选
+        assert_eq!(mgr.selection_ids(), &[b][..]);
+    }
+
+    /// 范围按**可见行**取：折叠起来的子行不算在范围内。
+    #[test]
+    fn shift_range_follows_visible_rows_only() {
+        let mut mgr = LayerManager::default();
+        let g = mgr.add_group("G".into());
+        let inner = mgr.add(boxed_layer("in", 0.0));
+        mgr.select(u64::MAX);
+        let bottom = mgr.add(boxed_layer("bottom", 1.0));
+        // 顶层自上而下：bottom, G(in)
+
+        mgr.select(bottom);
+        mgr.select_range(inner); // 组是展开的 ⇒ inner 也是可见行
+        assert_eq!(mgr.selection_ids().len(), 3);
+
+        mgr.set_all_expanded(false); // 折叠后 inner 不在可见行里
+        mgr.select(bottom);
+        mgr.select_range(g);
+        assert_eq!(
+            mgr.selection_ids(),
+            &[bottom, g][..],
+            "折叠的子行不应混进范围"
+        );
+
+        // 锚点落在已折叠的子行上 ⇒ 无从界定范围，退回单选
+        mgr.select(inner);
+        mgr.select_range(g);
+        assert_eq!(mgr.selection_ids(), &[g][..]);
+    }
+
+    /// 删除节点时，选择集里随之消失的项（含子树内的）要被清掉。
+    #[test]
+    fn remove_prunes_every_selected_descendant() {
+        let mut mgr = LayerManager::default();
+        let g = mgr.add_group("G".into());
+        let inner = mgr.add(boxed_layer("in", 0.0));
+        mgr.select(u64::MAX);
+        let out = mgr.add(boxed_layer("out", 1.0));
+
+        mgr.select(out);
+        mgr.toggle_select(inner);
+        assert_eq!(mgr.selection_ids(), &[out, inner][..]);
+
+        mgr.remove(g); // inner 随子树一起消失
+        assert_eq!(mgr.selection_ids(), &[out][..]);
+        assert_eq!(mgr.selected_id(), Some(out));
     }
 
     /// 只有空组时 panel 视为"无图层"。

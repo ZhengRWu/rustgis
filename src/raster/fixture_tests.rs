@@ -25,7 +25,11 @@ fn fixture_path(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("rustgis-raster-fixtures");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
-    for candidate in [path.clone(), super::overview_path(&path)] {
+    for candidate in [
+        path.clone(),
+        super::overview_path(&path),
+        super::pam::aux_path(&path),
+    ] {
         let _ = std::fs::remove_file(&candidate);
         let _ = std::fs::remove_file(candidate.with_extension("tmp"));
     }
@@ -52,6 +56,20 @@ pub(crate) fn large_geotiff(name: &str) -> PathBuf {
     let mut image = encoder.new_image::<colortype::Gray8>(2048, 2048).unwrap();
     write_geotiff_tags(&mut image, 32650);
     let pixels: Vec<u8> = (0..2048 * 2048).map(|i| (i % 251) as u8).collect();
+    image.write_data(&pixels).unwrap();
+    drop(encoder);
+    path
+}
+
+/// 供其它模块测试复用：写一张 2100×2100（约 441 万像素，超过金字塔询问阈值
+/// 2048²）、无概览、带地理参考的灰度 GeoTIFF。
+pub(crate) fn pyramid_prompt_geotiff(name: &str) -> PathBuf {
+    let path = fixture_path(name);
+    let file = std::fs::File::create(&path).unwrap();
+    let mut encoder = TiffEncoder::new(file).unwrap();
+    let mut image = encoder.new_image::<colortype::Gray8>(2100, 2100).unwrap();
+    write_geotiff_tags(&mut image, 32650);
+    let pixels: Vec<u8> = (0..2100 * 2100).map(|i| (i % 251) as u8).collect();
     image.write_data(&pixels).unwrap();
     drop(encoder);
     path
@@ -1100,4 +1118,61 @@ fn safe_package_reads_downscaled_display_source() {
     }
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// LZW 边缘瓦片回退解码（真实大影像，环境变量门控）
+// ---------------------------------------------------------------------------
+
+/// 背景：tiff crate 对边缘瓦片走「逐行小缓冲」读取路径，个别 LZW 流会在最后
+/// 一小段读取时触发 weezl 的 NoProgress 误报（"no lzw end code found"，流本身
+/// 完整、带结束码，PIL / libtiff 均可正常解码）。修复：`ensure_block` 对 LZW
+/// 块失败时回退到「原始字节 + weezl 整段解码 + 自行裁剪 / 预测器」。
+///
+/// 验证文件不能入库（371 MB），用环境变量指定：
+/// `LZW_TIF=E:/.../S2A_T32TQR_20261016_RGB_color_10m.tif`
+fn lzw_fixture() -> Option<PathBuf> {
+    std::env::var_os("LZW_TIF").map(PathBuf::from)
+}
+
+/// 曾失败的具体场景：块 1074（col 42、row 24 → x=10752、y=6144，裁剪后
+/// 228×256）在修复前报「文件读写失败：no lzw end code found」。
+#[test]
+fn lzw_edge_tile_fallback_recovers_all_blocks() {
+    let Some(path) = lzw_fixture() else {
+        eprintln!("跳过：未设置 LZW_TIF");
+        return;
+    };
+    let mut dataset = RasterDataset::open(&path).unwrap();
+    assert_eq!(dataset.width(), 10980);
+    assert_eq!(dataset.height(), 10980);
+
+    let window = PixelWindow::new(10752, 6144, 228, 256);
+    for band in 0..3 {
+        let plane = dataset.read_window(window, band).unwrap();
+        assert_eq!(plane.len(), 228 * 256);
+        // 真实卫星影像不该是全零（若回退错误地填零会在此暴露）。
+        let nonzero = plane.iter().filter(|value| **value > 0.0).count();
+        assert!(nonzero > 1000, "波段 {band} 几乎全零，回退解码可能失败");
+    }
+
+    // 覆盖整行（含右边缘一整列瓦片）的分块对齐读取。
+    let strip = PixelWindow::new(0, 6144, 10980, 256);
+    let plane = dataset.read_window(strip, 0).unwrap();
+    assert_eq!(plane.len(), 10980 * 256);
+}
+
+/// 统计计算（并行全量路径）在含坏块回退的影像上正常完成。
+#[test]
+fn statistics_over_lzw_dataset_complete() {
+    let Some(path) = lzw_fixture() else {
+        eprintln!("跳过：未设置 LZW_TIF");
+        return;
+    };
+    let mut dataset = RasterDataset::open(&path).unwrap();
+    let stats = dataset
+        .compute_statistics(0, &AtomicBool::new(false), &mut |_| {})
+        .unwrap();
+    assert!(stats.max > stats.min);
+    assert!(stats.valid_count > 0);
 }

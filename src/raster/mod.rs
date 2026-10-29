@@ -13,7 +13,9 @@
 pub mod extract_mask;
 mod geotiff;
 mod jp2;
+pub mod mosaic;
 mod paint;
+pub mod pam;
 mod pyramid;
 mod safe;
 mod stats;
@@ -43,6 +45,10 @@ pub const DEFAULT_MAX_READ_BYTES: u64 = 256 * 1024 * 1024;
 
 /// 超过这个像素数时统计改为整幅降采样抽样（而不是逐窗全分辨率读取）。
 const STATS_SAMPLE_PIXELS: u64 = 16_000_000;
+
+/// 单个解码块超过这个像素数（64 MiB 的 f32）视为巨块：并行分片会重复解码
+/// 同一巨块，统计退回单线程流式路径。
+const HUGE_BLOCK_PIXELS: u64 = 16 * 1024 * 1024;
 
 /// Sentinel-2 波段允许使用的最深小波降采样层数（÷256）。
 const MAX_SAFE_REDUCTION_LEVELS: u8 = 8;
@@ -811,11 +817,26 @@ impl RasterDataset {
         let mut meta = build_metadata(&info, &geotiff, &levels);
         meta.has_external_overviews = external.is_some();
 
-        let stats = meta
+        // 统计来源优先级：PAM 附属文件（.aux.xml，ArcGIS / GDAL / 本程序写）
+        // > TIFF 内嵌 GDAL_METADATA 统计标签。PAM 是最近一次计算的落盘结果。
+        let mut stats: Vec<Option<BandStatistics>> = meta
             .bands
             .iter()
             .map(|band| band.stored_stats.clone())
             .collect();
+        for (index, loaded) in pam::load_statistics(&path, meta.band_count)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(loaded) = loaded {
+                if let Some(slot) = stats.get_mut(index) {
+                    *slot = Some(loaded.clone());
+                }
+                if let Some(info) = meta.bands.get_mut(index) {
+                    info.stored_stats = Some(loaded);
+                }
+            }
+        }
 
         Ok(Self {
             path,
@@ -1212,7 +1233,13 @@ impl RasterDataset {
         self.statistics(band).is_some()
     }
 
-    /// 计算波段统计值。大影像按步长抽样（`estimated = true`）。
+    /// 计算波段统计值。
+    ///
+    /// - SAFE 包（小波降采样）与已有概览的大影像（概览层级解码量小）：
+    ///   整幅降采样后抽样统计，`estimated = true`；
+    /// - 其余 TIFF：**多线程并行全量统计**——压缩解码是 CPU 瓶颈，每个线程
+    ///   独立打开文件、解码互不相交的行带，速度接近线性提升，同时结果从
+    ///   抽样估算升级为精确值。
     pub fn compute_statistics(
         &mut self,
         band: usize,
@@ -1227,9 +1254,19 @@ impl RasterDataset {
         }
         let nodata = self.meta.nodata;
         let total = u64::from(self.width()) * u64::from(self.height());
-        let mut acc = stats::StatsAccumulator::new();
         let band = band as u16;
-        if total > STATS_SAMPLE_PIXELS {
+        // 块过大（如整幅单条带的 TIFF）：并行分片会让每个线程重复解码同一
+        // 巨块，得不偿失，走单线程流式路径。
+        let (block_width, block_height) = match &self.source {
+            DatasetSource::Tiff { base, .. } => (base.info.block_width, base.info.block_height),
+            DatasetSource::Safe { .. } => (256, 256),
+        };
+        let huge_block =
+            u64::from(block_width) * u64::from(block_height) > HUGE_BLOCK_PIXELS;
+        if matches!(self.source, DatasetSource::Safe { .. })
+            || huge_block
+            || (total > STATS_SAMPLE_PIXELS && self.has_overviews())
+        {
             // 大影像整幅降采样后再统计：TIFF 走概览、SAFE 走小波分辨率，
             // 只解码一两千万像素就够，避免逐窗全分辨率解码（L2A 的 10 m 波段
             // 全分辨率有 1.2 亿像素，单窗解码就会超出解码器的内存上限）。
@@ -1240,6 +1277,7 @@ impl RasterDataset {
                 out_height,
                 &[usize::from(band)],
             )?;
+            let mut acc = stats::StatsAccumulator::new();
             for plane in &planes {
                 for &value in plane {
                     acc.add(f64::from(value), nodata);
@@ -1250,37 +1288,122 @@ impl RasterDataset {
             result.estimated = true;
             self.store_statistics(band, result)
         } else {
-            let stride = ((total as f64 / 16_000_000f64).sqrt().ceil() as u32).max(1);
-            let rows_per_window = (2048 * stride).max(1);
-            let mut row = 0u32;
-            while row < self.height() {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(RasterError::Cancelled);
-                }
-                let rows = rows_per_window.min(self.height() - row);
-                let window = PixelWindow::new(0, row, self.width(), rows);
-                let plane = self.read_window(window, usize::from(band))?;
-                let width = usize::try_from(window.width).unwrap_or(0);
-                for y in (0..usize::try_from(rows).unwrap_or(0)).step_by(stride as usize) {
-                    let start = y * width;
-                    let end = start + width;
-                    if end > plane.len() {
-                        break;
-                    }
-                    for &value in plane[start..end].iter().step_by(stride as usize) {
-                        acc.add(f64::from(value), nodata);
-                    }
-                }
-                row += rows;
-                progress((row as f32 / self.height().max(1) as f32).min(1.0));
-            }
-            let mut result = acc.finish();
-            result.estimated = stride > 1;
-            self.store_statistics(band, result)
+            let threads = Self::statistics_threads(
+                u64::from(self.width()) * u64::from(self.height()),
+            );
+            self.compute_statistics_parallel(band, nodata, threads, cancel, progress)
         }
     }
 
+    /// 并行统计的线程数：每 400 万像素一个线程，受 CPU 核数与上限 8 约束。
+    fn statistics_threads(total_px: u64) -> usize {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let by_size = (total_px / 4_000_000).max(1) as usize;
+        by_size.min(cpus).min(8)
+    }
+
+    /// 多线程并行统计：把行按线程均分，每个线程独立打开文件、顺序解码自己
+    /// 行带内的块对齐窗口并全量累计，最后归并各累加器。
+    ///
+    /// 解码窗口按块高对齐（跨窗不重复解码同一条带），单窗内存约 2M 像素；
+    /// 进度由共享原子行计数器汇报，取消时工作线程在下个窗口前退出。
+    fn compute_statistics_parallel(
+        &mut self,
+        band: u16,
+        nodata: Option<f64>,
+        threads: usize,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(f32),
+    ) -> Result<BandStatistics, RasterError> {
+        let path = self.path.clone();
+        let width = self.width();
+        let height = self.height();
+        let threads = threads.max(1);
+        let block_height = match &self.source {
+            DatasetSource::Tiff { base, .. } => base.info.block_height,
+            DatasetSource::Safe { .. } => 256,
+        }
+        .max(1);
+        let want_rows = (2_000_000f64 / f64::from(width.max(1))).ceil() as u32;
+        let rows_per_read = want_rows
+            .max(1)
+            .div_ceil(block_height)
+            .max(1)
+            .saturating_mul(block_height)
+            .clamp(block_height, 65536);
+        let chunk = height.div_ceil(threads as u32).max(1);
+        let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut outcome: Option<Result<stats::StatsAccumulator, RasterError>> = None;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for t in 0..threads {
+                let path = &path;
+                let done = &done;
+                let stop = &stop;
+                let start = (t as u32 * chunk).min(height);
+                let end = ((t as u32 + 1) * chunk).min(height).max(start);
+                handles.push(scope.spawn(move || {
+                    let mut dataset = RasterDataset::open(path)?;
+                    let mut acc = stats::StatsAccumulator::new();
+                    let mut row = start;
+                    while row < end {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed)
+                            || cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            return Err(RasterError::Cancelled);
+                        }
+                        let rows = rows_per_read.min(end - row);
+                        let plane = dataset.read_window(
+                            PixelWindow::new(0, row, width, rows),
+                            usize::from(band),
+                        )?;
+                        for &value in &plane {
+                            acc.add(f64::from(value), nodata);
+                        }
+                        row += rows;
+                        done.fetch_add(u64::from(rows), std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(acc)
+                }));
+            }
+            // 本线程轮询进度直到所有工作线程结束（或收到取消）。
+            loop {
+                if handles.iter().all(std::thread::ScopedJoinHandle::is_finished) {
+                    break;
+                }
+                let rows = done.load(std::sync::atomic::Ordering::Relaxed);
+                progress((rows as f32 / f64::from(height.max(1)) as f32).min(1.0));
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let mut merged = stats::StatsAccumulator::new();
+            let mut error = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(acc)) => merged.merge_from(acc),
+                    Ok(Err(e)) => error = Some(e),
+                    Err(_) => error = Some(RasterError::Cancelled),
+                }
+            }
+            outcome = Some(match error {
+                Some(e) => Err(e),
+                None => Ok(merged),
+            });
+        });
+        let merged = outcome.unwrap_or_else(|| Ok(stats::StatsAccumulator::new()))?;
+        let result = merged.finish();
+        self.store_statistics(band, result)
+    }
+
     /// 写回统计结果：槽位数由数据集构造时决定，这里做防御性取值。
+    ///
+    /// 同时把统计值落盘到 `<影像>.aux.xml`（GDAL PAM 格式，与 ArcGIS
+    /// CalculateStatistics 一致）：下次打开直接复用，不再重复计算。
+    /// SAFE 包没有对应的附属文件约定，跳过写盘。
     fn store_statistics(
         &mut self,
         band: u16,
@@ -1293,6 +1416,16 @@ impl RasterDataset {
             info.stored_stats = Some(result.clone());
         }
         self.statistics_version = self.statistics_version.wrapping_add(1);
+        if matches!(self.source, DatasetSource::Tiff { .. }) {
+            let total = u64::from(self.meta.width) * u64::from(self.meta.height);
+            // 抽样估算的 valid_count 不代表全幅有效像素数，不写 VALID_PERCENT。
+            let valid_percent = if result.estimated || total == 0 {
+                None
+            } else {
+                Some(result.valid_count as f64 / total as f64 * 100.0)
+            };
+            pam::save_statistics(&self.path, band as usize, &result, valid_percent);
+        }
         Ok(result)
     }
 
@@ -1805,6 +1938,79 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// 统计持久化端到端：第一次打开计算统计并写入 .aux.xml，
+    /// 第二次打开直接复用（from_file = true），不再重复计算。
+    #[test]
+    fn computed_statistics_are_persisted_to_pam_aux() {
+        let path = fixture_tests::sample_geotiff("pam-stats.tif");
+        let computed = {
+            let mut dataset = RasterDataset::open(&path).unwrap();
+            assert!(!dataset.has_statistics(0), "初始应没有统计值");
+            let computed = dataset
+                .compute_statistics(0, &AtomicBool::new(false), &mut |_| {})
+                .unwrap();
+            assert!(
+                pam::aux_path(&path).is_file(),
+                "计算后应写出 .aux.xml 附属文件"
+            );
+            computed
+        };
+        let dataset = RasterDataset::open(&path).unwrap();
+        assert!(dataset.has_statistics(0), "重开应能从 PAM 复用统计值");
+        let stats = dataset.statistics(0).unwrap();
+        assert!(stats.from_file);
+        assert_eq!(stats.min, computed.min);
+        assert_eq!(stats.max, computed.max);
+        assert!((stats.mean - computed.mean).abs() < 1e-9);
+        assert!((stats.std_dev - computed.std_dev).abs() < 1e-9);
+        assert_eq!(stats.histogram, computed.histogram);
+        let _ = std::fs::remove_file(pam::aux_path(&path));
+    }
+
+    /// 并行统计与单线程统计结果一致（浮点求和顺序差异用容差断言），
+    /// 且全量累计后 estimated = false。
+    #[test]
+    fn parallel_statistics_match_serial() {
+        let path = fixture_tests::sample_geotiff("stats-parallel.tif");
+        let serial = {
+            let mut dataset = RasterDataset::open(&path).unwrap();
+            dataset
+                .compute_statistics_parallel(0, None, 1, &AtomicBool::new(false), &mut |_| {})
+                .unwrap()
+        };
+        let parallel = {
+            let mut dataset = RasterDataset::open(&path).unwrap();
+            dataset
+                .compute_statistics_parallel(0, None, 4, &AtomicBool::new(false), &mut |_| {})
+                .unwrap()
+        };
+        assert!(!parallel.estimated, "全量累计不应标记为估算");
+        assert_eq!(parallel.valid_count, serial.valid_count);
+        assert_eq!(parallel.min, serial.min);
+        assert_eq!(parallel.max, serial.max);
+        assert!((parallel.mean - serial.mean).abs() < 1e-9);
+        assert!((parallel.std_dev - serial.std_dev).abs() < 1e-6);
+        assert_eq!(parallel.histogram.len(), serial.histogram.len());
+        let _ = std::fs::remove_file(pam::aux_path(&path));
+    }
+
+    /// 取消标志会让并行统计提前返回取消错误。
+    #[test]
+    fn parallel_statistics_honour_cancellation() {
+        let path = fixture_tests::large_geotiff("stats-parallel-cancel.tif");
+        let mut dataset = RasterDataset::open(&path).unwrap();
+        let cancelled = dataset.compute_statistics_parallel(
+            0,
+            None,
+            4,
+            &AtomicBool::new(true),
+            &mut |_| {},
+        );
+        assert!(matches!(cancelled, Err(RasterError::Cancelled)));
+        let _ = std::fs::remove_file(pam::aux_path(&path));
+    }
 
     #[test]
     fn pixel_window_clamps() {

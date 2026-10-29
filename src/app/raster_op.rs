@@ -93,8 +93,10 @@ impl RasterJob {
 }
 
 /// 「是否构建概览」的系统原生询问状态。
+///
+/// 一批导入只弹一次：打开完成的大影像先进 [`RustGisApp::pyramid_candidates`]
+/// 候选，等整批导入结束后统一询问；确认时对整批逐个排队构建。
 pub(super) struct PyramidPrompt {
-    layer: u64,
     body: String,
     /// 后台已弹出的原生询问框（`None` = 下一帧弹出）。
     job: Option<Confirm>,
@@ -222,16 +224,10 @@ impl RustGisApp {
                     }
                     // 已有内嵌统计值时不再重复计算。
                     self.start_statistics_for_display(id);
-                    // 大影像且无概览 → 询问是否构建金字塔。
+                    // 大影像且无概览 → 记入候选；等本批导入全部结束后统一
+                    // 询问一次，而不是每张都弹框打断批量拖放。
                     if !overviews && u64::from(width) * u64::from(height) > PYRAMID_PROMPT_PIXELS {
-                        self.raster_prompt = Some(PyramidPrompt {
-                            layer: id,
-                            body: self.tf(
-                                "dialog.pyramidBody",
-                                &[&unique, &format!("{width}×{height}")],
-                            ),
-                            job: None,
-                        });
+                        self.pyramid_candidates.push(id);
                     }
                 }
                 Ok(Err(e)) => {
@@ -263,6 +259,11 @@ impl RustGisApp {
     }
 
     /// 为当前显示用到的波段启动统计任务（三者都已有时不启动）。
+    ///
+    /// 同一时刻只跑一个栅格任务：若已有任务在跑（典型场景是拖入多幅 TIF，
+    /// 前一幅的统计还没算完，后一幅已打开），把本图层排入
+    /// [`RustGisApp::pending_statistics`]，当前任务结束后由
+    /// [`Self::poll_raster_job`] 依序接续，保证每幅图都会被统计。
     pub(super) fn start_statistics_for_display(&mut self, layer_id: u64) {
         let Some((handle, bands)) = self.raster_handle_and_bands(layer_id) else {
             return;
@@ -275,6 +276,10 @@ impl RustGisApp {
                 .collect()
         };
         if needed.is_empty() {
+            return;
+        }
+        if self.raster_job.is_some() {
+            self.pending_statistics.push_back(layer_id);
             return;
         }
         self.start_raster_job(layer_id, RasterJobKind::Statistics, handle, Some(needed));
@@ -394,17 +399,29 @@ impl RustGisApp {
                 let now = ctx.input(|input| input.time);
                 self.toasts.push(now, title, message);
                 // 结束态回到"就绪"：进行中的文案（正在计算统计…）不能一直挂着。
-                // 若还有排队中的金字塔任务，下面会立刻写入新的进行中文案。
+                // 若还有排队中的统计 / 金字塔任务，下面会立刻写入新的进行中文案。
                 self.status = Status::Ready;
-                // 任务结束后再执行排队中的金字塔构建。
-                if let Some(pending) = self.pending_pyramid.take() {
+                // 任务结束后先接续排队中的统计（拖入多幅 TIF 时后打开的图层
+                // 都排在这里），直到某次启动真正占住了任务槽或队列取空。
+                while let Some(pending) = self.pending_statistics.pop_front() {
+                    self.start_statistics_for_display(pending);
+                    if self.raster_job.is_some() {
+                        break;
+                    }
+                }
+                // 再执行排队中的金字塔构建（若统计任务已占住任务槽，这里会重新排队）。
+                while let Some(pending) = self.pending_pyramid.pop_front() {
                     self.begin_pyramid(pending);
+                    if self.raster_job.is_some() {
+                        break;
+                    }
                 }
                 ctx.request_repaint();
             }
             Ok(Err(e)) => {
                 self.raster_job = None;
-                self.pending_pyramid = None;
+                self.pending_pyramid.clear();
+                self.pending_statistics.clear();
                 self.status = Status::Message(self.tf("status.rasterJobError", &[&e]));
                 self.dialog = Some(crate::dialog::Dialog::Error { body: e });
             }
@@ -413,7 +430,8 @@ impl RustGisApp {
             }
             Err(TryRecvError::Disconnected) => {
                 self.raster_job = None;
-                self.pending_pyramid = None;
+                self.pending_pyramid.clear();
+                self.pending_statistics.clear();
                 let msg = self.t("status.loadAborted").to_string();
                 self.status = Status::Message(msg.clone());
                 self.dialog = Some(crate::dialog::Dialog::Error { body: msg });
@@ -441,26 +459,75 @@ impl RustGisApp {
             return;
         };
         if self.raster_job.is_some() {
-            self.pending_pyramid = Some(layer_id);
+            self.pending_pyramid.push_back(layer_id);
             return;
         }
         self.start_raster_job(layer_id, RasterJobKind::Pyramid, handle, None);
     }
 
+    /// 根据候选图层生成询问正文：单幅沿用原文案，多幅列出图层名（最多 5 个）。
+    fn pyramid_batch_body(&self) -> String {
+        let names: Vec<String> = self
+            .pyramid_candidates
+            .iter()
+            .filter_map(|id| self.layers.node(*id).map(|n| n.name().to_string()))
+            .collect();
+        if names.len() == 1 {
+            let dims = self
+                .layers
+                .node(self.pyramid_candidates[0])
+                .and_then(|n| n.raster())
+                .map(|layer| {
+                    let dataset = layer.dataset();
+                    let meta = dataset.metadata();
+                    format!("{}×{}", meta.width, meta.height)
+                })
+                .unwrap_or_default();
+            return self.tf("dialog.pyramidBody", &[&names[0], &dims]);
+        }
+        let count = names.len().to_string();
+        let mut list = names.iter().take(5).cloned().collect::<Vec<_>>().join("\n");
+        if names.len() > 5 {
+            list.push_str("\n…");
+        }
+        self.tf("dialog.pyramidBatchBody", &[&count, &list])
+    }
+
+    /// 本批导入已全部结束（拖放队列 / 矢量导入 / 栅格打开都空闲）。
+    fn pyramid_batch_idle(&self) -> bool {
+        self.drop_queue.is_empty()
+            && self.import.is_none()
+            && self.raster_stage.is_none()
+    }
+
+    /// 候选非空且本批导入已结束时，创建"是否构建概览"询问（只创建一次）。
+    ///
+    /// 拆成独立步骤供无头测试复用：测试不能真的弹出系统原生对话框。
+    fn maybe_create_pyramid_prompt(&mut self) {
+        if self.raster_prompt.is_some()
+            || self.pyramid_candidates.is_empty()
+            || !self.pyramid_batch_idle()
+        {
+            return;
+        }
+        let body = self.pyramid_batch_body();
+        self.raster_prompt = Some(PyramidPrompt { body, job: None });
+    }
+
     /// 「是否构建概览」：**系统原生**询问框（后台线程弹出、这里非阻塞轮询）。
     ///
     /// 与提示框（[`crate::dialog::NativeDialog`]）同一套约定：弹框开着时 UI
-    /// 循环照常运行；用户点「是」才开始构建金字塔，「否」/ 关闭窗口则跳过。
+    /// 循环照常运行；用户点「是」才开始构建金字塔，「否」/ 关闭窗口则跳过
+    /// （整批候选一并清空，后续新导入的批次会重新询问）。
     pub(super) fn show_pyramid_prompt(&mut self, ctx: &Context) {
-        let Some((layer, body)) = self
-            .raster_prompt
-            .as_ref()
-            .map(|p| (p.layer, p.body.clone()))
-        else {
-            return;
-        };
+        self.maybe_create_pyramid_prompt();
 
         if self.raster_prompt.as_ref().is_some_and(|p| p.job.is_none()) {
+            let body = self
+                .raster_prompt
+                .as_ref()
+                .map(|p| p.body.clone())
+                .unwrap_or_default();
             let job = Confirm::open(
                 self.t("dialog.pyramidTitle").to_string(),
                 format!("{body}\n\n{}", self.t("dialog.pyramidHint")),
@@ -483,8 +550,11 @@ impl RustGisApp {
             return;
         };
         self.raster_prompt = None;
+        let candidates = std::mem::take(&mut self.pyramid_candidates);
         if confirmed {
-            self.begin_pyramid(layer);
+            for layer in candidates {
+                self.begin_pyramid(layer);
+            }
         }
         ctx.request_repaint();
     }
@@ -496,16 +566,9 @@ impl RustGisApp {
         {
             job.cancel.store(true, Ordering::Relaxed);
         }
-        if self.pending_pyramid == Some(layer_id) {
-            self.pending_pyramid = None;
-        }
-        if self
-            .raster_prompt
-            .as_ref()
-            .is_some_and(|p| p.layer == layer_id)
-        {
-            self.raster_prompt = None;
-        }
+        self.pending_pyramid.retain(|id| *id != layer_id);
+        self.pyramid_candidates.retain(|id| *id != layer_id);
+        self.pending_statistics.retain(|id| *id != layer_id);
     }
 }
 
@@ -654,5 +717,98 @@ mod tests {
         app.raster_props = None;
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 拖入多幅 TIF：后打开的图层统计不能被正在运行的任务静默吞掉，
+    /// 而应排队，当前任务结束后依序接续，保证每幅图都有统计值。
+    #[test]
+    fn multiple_rasters_queue_statistics_while_busy() {
+        let path = sample_geotiff("stats-queue.tif");
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::new(&ctx);
+
+        // 第一幅：走真实打开流水线，导入完成后统计任务立即启动。
+        let layer = RasterLayer::open(&path, String::new()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(layer)).unwrap();
+        app.raster_stage = Some(RasterStage::Opening {
+            rx,
+            name: "stats-queue-a".to_owned(),
+        });
+        app.poll_raster_stage(&ctx);
+        assert!(app.raster_job.is_some(), "第一幅导入后应立即开始统计");
+
+        // 第二幅在第一幅统计仍在运行时打开完成：统计应排队而不是被丢弃。
+        let layer = RasterLayer::open(&path, String::new()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(layer)).unwrap();
+        app.raster_stage = Some(RasterStage::Opening {
+            rx,
+            name: "stats-queue-b".to_owned(),
+        });
+        app.poll_raster_stage(&ctx);
+        assert_eq!(app.pending_statistics.len(), 1, "忙碌时第二幅的统计应排队");
+
+        let ids: Vec<u64> = app
+            .layers
+            .iter_visible_rasters()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(ids.len(), 2, "两幅图都应已加入图层树");
+
+        // 依次等两个统计任务都跑完。
+        for _ in 0..800 {
+            app.poll_raster_job(&ctx);
+            if app.raster_job.is_none() && app.pending_statistics.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.raster_job.is_none(), "所有统计任务应已结束");
+        assert!(app.pending_statistics.is_empty(), "统计队列应取空");
+        for id in ids {
+            let layer = app.layers.node(id).and_then(|n| n.raster()).expect("图层存在");
+            let handle = layer.handle();
+            let dataset = handle.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(dataset.has_statistics(0), "每幅图的显示波段都应有统计值");
+        }
+    }
+
+    /// 批量导入多幅大影像（无概览）：打开过程中不逐张弹框，整批结束后
+    /// 只创建一次"是否构建概览"询问。
+    #[test]
+    fn batch_import_prompts_pyramids_once() {
+        let path =
+            crate::raster::fixture_tests::pyramid_prompt_geotiff("pyramid-batch.tif");
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::new(&ctx);
+
+        // 两幅大影像依次打开：都进候选，不弹框。
+        for name in ["pyramid-batch-a", "pyramid-batch-b"] {
+            let layer = RasterLayer::open(&path, String::new()).unwrap();
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok(layer)).unwrap();
+            app.raster_stage = Some(RasterStage::Opening {
+                rx,
+                name: name.to_owned(),
+            });
+            app.poll_raster_stage(&ctx);
+        }
+        assert_eq!(app.pyramid_candidates.len(), 2, "两幅都应进入候选");
+        assert!(app.raster_prompt.is_none(), "打开过程中不应弹框");
+
+        // 拖放队列里还有待导入文件时：整批未结束，不弹框。
+        app.drop_queue.push_back(path.clone());
+        app.show_pyramid_prompt(&ctx);
+        assert!(app.raster_prompt.is_none(), "批量导入未结束不应弹框");
+        app.drop_queue.clear();
+
+        // 本批结束后：只创建一次询问；候选保留到用户作答，不会重复弹。
+        app.maybe_create_pyramid_prompt();
+        assert!(app.raster_prompt.is_some(), "批量结束后应弹一次询问");
+        let first = app.raster_prompt.as_ref().unwrap();
+        assert!(first.job.is_none(), "测试中不应真正弹出系统对话框");
+        app.maybe_create_pyramid_prompt();
+        assert!(app.raster_prompt.is_some(), "询问已存在时不应重复创建");
     }
 }

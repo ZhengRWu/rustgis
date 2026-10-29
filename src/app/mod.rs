@@ -10,15 +10,16 @@
 //! - [`geoprocess_dialog`]：叠加类地理处理工具（裁剪 / 相交 / 联合 / 合并 / 融合）；
 //! - [`project_op`]：工程文件打开 / 保存后台流水线（含系统"保存更改？"提示）；
 //! - [`raster_dialog`]：栅格图层属性对话框（常规 / 源 / 范围 / 显示 / 符号系统 / 时间）；
-//! - [`raster_op`]：栅格导入、统计与金字塔后台流水线（v0.3）。
+//! - [`raster_op`]：栅格导入、统计与金字塔后台流水线（v0.3）；
+//! - [`new_vector`]：新建矢量图层（对话框 → 数字化绘制 → Shapefile / GeoJSON 落盘，v0.5）。
 //!
 //! UI 线程只做非阻塞轮询：导入 / 打开 / 保存的重活都在后台线程
 //! （[`ImportStage`](import::ImportStage) / [`ProjectStage`](project_op::ProjectStage)），
 //! 任何时刻都不锁住窗口。
 
 pub mod attr_table;
-mod catalog;
 pub mod buffer_dialog;
+mod catalog;
 mod find;
 pub mod geoprocess_dialog;
 mod goto_xy;
@@ -26,6 +27,7 @@ pub mod identify;
 pub mod import;
 pub mod layers_panel;
 pub mod map_view;
+pub mod new_vector;
 pub mod project_op;
 pub mod raster_dialog;
 pub mod raster_op;
@@ -123,6 +125,16 @@ pub struct RustGisApp {
     buffer_dialog: Option<BufferWindow>,
     /// 后台缓冲流水线（确定之后、结果加入图层之前）。
     buffer_job: Option<BufferJob>,
+    /// 「新建矢量图层」独立窗口（目录栏右键 → 新建 → 矢量）。
+    new_vector: Option<new_vector::NewVectorWindow>,
+    /// 正在进行的数字化会话（新建矢量后自动进入；停止编辑后清空）。
+    editing: Option<new_vector::Editing>,
+    /// 矢量落盘的后台任务（保存编辑）。
+    save_job: Option<new_vector::SaveJob>,
+    /// 「停止编辑」时弹的系统原生询问框（是否保存未落盘的编辑）。
+    stop_prompt: Option<dialog::Confirm>,
+    /// 新建矢量时「目标文件已存在，是否覆盖」的询问框 + 待创建的请求。
+    overwrite_prompt: Option<(new_vector::PendingCreate, dialog::Confirm)>,
     /// 「地理处理」独立窗口（裁剪 / 相交 / 联合 / 合并 / 融合共用）。
     geo_dialog: Option<GeoWindow>,
     /// 后台地理处理流水线（确定之后、结果加入图层之前）。
@@ -130,6 +142,8 @@ pub struct RustGisApp {
     toolbox: toolbox::Toolbox,
     mask_dialog: toolbox::MaskDialog,
     mask_job: Option<toolbox::MaskJob>,
+    mosaic_dialog: toolbox::MosaicDialog,
+    mosaic_job: Option<toolbox::MosaicJob>,
     /// 上一帧中央地图区域（缓冲结果落点判断用：视图是否已包含结果范围）。
     map_rect: Option<egui::Rect>,
     /// 下一帧将视图适配到全部数据范围。
@@ -163,8 +177,13 @@ pub struct RustGisApp {
     raster_stage: Option<RasterStage>,
     /// 栅格后台任务（统计 / 金字塔构建），同一时刻只跑一个。
     raster_job: Option<RasterJob>,
-    /// 因任务忙碌而排队等待开始构建金字塔的图层。
-    pending_pyramid: Option<u64>,
+    /// 因任务忙碌而排队等待构建金字塔的图层（按顺序，任务结束逐个接续）。
+    pending_pyramid: std::collections::VecDeque<u64>,
+    /// 因任务忙碌而排队等待计算统计值的图层（按导入顺序，一次取一个）。
+    pending_statistics: std::collections::VecDeque<u64>,
+    /// 已打开、缺少概览且尺寸较大的栅格：等本批导入全部结束后，
+    /// 对整批只弹一次"是否构建金字塔"询问（见 [`raster_op::PyramidPrompt`]）。
+    pyramid_candidates: Vec<u64>,
     /// "是否构建金字塔"提示窗口。
     raster_prompt: Option<PyramidPrompt>,
     /// 栅格图层属性对话框（双击图层或右键「属性」打开）。
@@ -229,9 +248,16 @@ impl RustGisApp {
             buffer_job: None,
             geo_dialog: None,
             geo_job: None,
+            new_vector: None,
+            editing: None,
+            save_job: None,
+            stop_prompt: None,
+            overwrite_prompt: None,
             toolbox: toolbox::Toolbox::default(),
             mask_dialog: toolbox::MaskDialog::default(),
             mask_job: None,
+            mosaic_dialog: toolbox::MosaicDialog::default(),
+            mosaic_job: None,
             map_rect: None,
             needs_fit: false,
             zoom_extent: None,
@@ -244,7 +270,9 @@ impl RustGisApp {
             project_op: None,
             raster_stage: None,
             raster_job: None,
-            pending_pyramid: None,
+            pending_pyramid: std::collections::VecDeque::new(),
+            pending_statistics: std::collections::VecDeque::new(),
+            pyramid_candidates: Vec::new(),
             raster_prompt: None,
             raster_props: None,
             raster_painter: crate::raster::RasterPainter::default(),
@@ -352,6 +380,10 @@ impl RustGisApp {
                 self.mask_dialog.open = true;
                 MenuAction::None
             }
+            "raster.mosaicToNewRaster" => {
+                self.mosaic_dialog.open = true;
+                MenuAction::None
+            }
             // ── 文件：工程生命周期（对标 ArcGIS 文件菜单） ──
             "file.new" => {
                 self.start_new();
@@ -386,6 +418,11 @@ impl RustGisApp {
             // 插入 → 添加 Sentinel-2 SAFE 产品包（v0.4）：SAFE 是目录，选择文件夹。
             "layer.addSafe" => {
                 self.pick_and_add_safe();
+                MenuAction::None
+            }
+            // 插入 → 新建矢量图层（v0.5）：与目录栏右键「新建 → 矢量」同一对话框。
+            "layer.newVector" => {
+                self.open_new_vector_dialog();
                 MenuAction::None
             }
             // 地理处理 → 缓冲区：ArcGIS 风格参数对话框（确定后结果自动加入地图）。
@@ -460,7 +497,13 @@ impl eframe::App for RustGisApp {
         self.poll_buffer_job(ctx);
         // 后台地理处理流水线推进（裁剪 / 相交 / 联合 / 合并 / 融合）
         self.poll_geo_job(ctx);
+        // 新建矢量：对话框 + 数字化落盘 + 「停止编辑」询问框
+        self.show_new_vector_dialog(ctx);
+        self.poll_save_job(ctx);
+        self.poll_stop_prompt();
+        self.poll_overwrite_prompt();
         self.poll_mask_job(ctx);
+        self.poll_mosaic_job(ctx);
         // 后台栅格流水线推进（导入 / 统计 / 金字塔构建，不阻塞主线程）
         self.poll_raster_stage(ctx);
         self.poll_raster_job(ctx);
@@ -581,6 +624,9 @@ impl eframe::App for RustGisApp {
         // 「识别结果」浮窗：地图点击后显示最顶层要素 / 像元信息。
         self.show_identify_window(ctx);
 
+        // 「编辑」浮窗：新建矢量后的数字化面板（属性输入 + 保存 / 停止编辑）。
+        self.show_edit_panel(ctx);
+
         // 「转到 XY」浮窗：输入工程坐标居中地图。
         self.show_goto_xy(ctx);
 
@@ -601,6 +647,7 @@ impl eframe::App for RustGisApp {
         self.show_geoprocess_dialog(ctx);
         self.show_toolbox(ctx);
         self.show_mask_dialog(ctx);
+        self.show_mosaic_dialog(ctx);
 
         // 「是否构建金字塔」提示 + 栅格图层属性对话框。
         self.show_pyramid_prompt(ctx);

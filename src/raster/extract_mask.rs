@@ -118,16 +118,19 @@ fn pixel_bounds(
         }
         pixels.extend_point(q);
     }
-    // Projection round-trips can place a mathematically integral pixel edge a
-    // few ULPs to either side. Snap only those near-integer coordinates so a
-    // transformed mask does not accidentally gain a whole border of pixels.
+    // Projection round-trips (e.g. UTM → geographic → UTM) place a
+    // mathematically integral pixel edge a fraction of a pixel away from the
+    // integer: the Transverse Mercator series is millimetre-accurate, which is
+    // ~1e-5..1e-3 px for metre-sized pixels. Snap only those near-integer
+    // coordinates so a transformed mask does not accidentally gain a whole
+    // border of pixels from round-trip noise.
     let floor_edge = |v: f64| {
         let n = v.round();
-        if (v - n).abs() < 1e-7 { n } else { v.floor() }
+        if (v - n).abs() < 1e-3 { n } else { v.floor() }
     };
     let ceil_edge = |v: f64| {
         let n = v.round();
-        if (v - n).abs() < 1e-7 { n } else { v.ceil() }
+        if (v - n).abs() < 1e-3 { n } else { v.ceil() }
     };
     let x = floor_edge(pixels.min[0]).clamp(0., f64::from(width)) as u32;
     let y = floor_edge(pixels.min[1]).clamp(0., f64::from(height)) as u32;
@@ -426,17 +429,28 @@ mod tests {
         }
     }
     fn write(path: &Path, values: &[f32], bands: usize, transform: Affine) {
-        write_epsg(path, values, bands, transform, 32650);
+        write_sized(path, values, bands, transform, 32650, 4, 4);
     }
     fn write_epsg(path: &Path, values: &[f32], bands: usize, transform: Affine, epsg: u16) {
+        write_sized(path, values, bands, transform, epsg, 4, 4);
+    }
+    fn write_sized(
+        path: &Path,
+        values: &[f32],
+        bands: usize,
+        transform: Affine,
+        epsg: u16,
+        width: u32,
+        height: u32,
+    ) {
         let mut encoder = TiffEncoder::new(File::create(path).unwrap()).unwrap();
-        let mut image = encoder.new_image::<Gray32Float>(4, 4).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(width, height).unwrap();
         if bands > 1 {
             image
                 .extra_samples(&vec![ExtraSamples::Unspecified; bands - 1])
                 .unwrap();
         }
-        image.rows_per_strip(4).unwrap();
+        image.rows_per_strip(height).unwrap();
         let gt = transform.geotransform();
         image
             .encoder()
@@ -675,7 +689,15 @@ mod tests {
             0.,
             -(max_lat - min_lat) / 32.,
         ]);
-        write_epsg(&mask_path, &vec![1.; 32 * 32], 1, mask_affine, 4326);
+        write_sized(
+            &mask_path,
+            &vec![1.; 32 * 32],
+            1,
+            mask_affine,
+            4326,
+            32,
+            32,
+        );
         run(&input, MaskSource::Raster(mask_path), &output).unwrap();
         let mut result = RasterDataset::open(output).unwrap();
         let values = result.read_window(PixelWindow::new(0, 0, 4, 4), 0).unwrap();

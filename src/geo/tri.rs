@@ -12,6 +12,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
 
+use geo::algorithm::bool_ops::{BooleanOps, OpType};
+use geo::algorithm::intersects::Intersects;
 use geo::algorithm::triangulate_earcut::TriangulateEarcut;
 use geo::{Coord, LineString, Polygon};
 
@@ -135,6 +137,94 @@ fn ring(points: &[[f64; 2]]) -> LineString<f64> {
 
 fn holes_at(holes: &[Vec<Vec<[f64; 2]>>], index: usize) -> &[Vec<[f64; 2]>] {
     holes.get(index).map(Vec::as_slice).unwrap_or(&[])
+}
+
+// ─────────────────────────── 自相交环的合法化 ───────────────────────────
+
+/// 环是否「简单」（除相邻边共享端点外，任何两条边都不相交）。
+///
+/// 数字化画出的蝴蝶结（路径交叉）不是简单环——earcut 对这类输入会剖出错误的
+/// 三角片（渲染成残缺的碎片），必须先拆分。
+pub fn ring_is_simple(ring: &[[f64; 2]]) -> bool {
+    let n = ring.len();
+    if n < 3 {
+        return true;
+    }
+    // 线段列表：丢掉零长段（重复顶点），首尾自动闭合。
+    let segs: Vec<([f64; 2], [f64; 2])> = (0..n)
+        .map(|i| (ring[i], ring[(i + 1) % n]))
+        .filter(|(a, b)| a != b)
+        .collect();
+    let m = segs.len();
+    if m < 3 {
+        return true;
+    }
+    let shares_endpoint = |(a0, a1): ([f64; 2], [f64; 2]), (b0, b1): ([f64; 2], [f64; 2])| {
+        a0 == b0 || a0 == b1 || a1 == b0 || a1 == b1
+    };
+    for i in 0..m {
+        for j in (i + 1)..m {
+            // 相邻段只在共享端点处相接，豁免；非相邻段即便共享端点也算自接触。
+            let adjacent = j == i + 1 || (i == 0 && j == m - 1);
+            if adjacent && shares_endpoint(segs[i], segs[j]) {
+                continue;
+            }
+            let (a0, a1) = segs[i];
+            let (b0, b1) = segs[j];
+            let line_a = geo::Line::new(coord(a0), coord(a1));
+            let line_b = geo::Line::new(coord(b0), coord(b1));
+            if line_a.intersects(&line_b) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 把（可能自相交的）多边形拆成简单多边形集合：`Vec<(外环, 孔)>`。
+///
+/// 对标 QGIS 对无效面的渲染语义：Qt `OddEvenFill` / OGC makeValid 的偶奇规则——
+/// 交叉处的「翻转面积」不算实体，蝴蝶结填成两瓣（见 `QgsMapToolCapture` 的
+/// `ValidateGeometries` 能力与无效面的显示效果）。实现走 `geo::BooleanOps`
+/// 的 union，其默认填充规则就是 `FillRule::EvenOdd`。
+///
+/// 简单输入原样返回（不跑布尔运算：避免坐标噪声与无谓开销）。
+pub fn polygon_parts(
+    outer_closed: &[[f64; 2]],
+    holes: &[Vec<[f64; 2]>],
+) -> Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> {
+    if ring_is_simple(outer_closed) {
+        return vec![(outer_closed.to_vec(), holes.to_vec())];
+    }
+    let line = |pts: &[[f64; 2]]| {
+        LineString::new(pts.iter().map(|p| coord(*p)).collect::<Vec<Coord<f64>>>())
+    };
+    let polygon = Polygon::new(
+        line(outer_closed),
+        holes.iter().map(|h| line(h)).collect(),
+    );
+    let fixed = polygon.boolean_op(&polygon, OpType::Union);
+    fixed
+        .0
+        .iter()
+        .map(|part| {
+            (
+                part.exterior()
+                    .points()
+                    .map(|p| [p.x(), p.y()])
+                    .collect::<Vec<[f64; 2]>>(),
+                part.interiors()
+                    .iter()
+                    .map(|ring| ring.points().map(|p| [p.x(), p.y()]).collect())
+                    .collect(),
+            )
+        })
+        .filter(|(outer, _)| outer.len() >= 3)
+        .collect()
+}
+
+fn coord(p: [f64; 2]) -> Coord<f64> {
+    Coord { x: p[0], y: p[1] }
 }
 
 /// 线程数：顶点规模不够就串行；否则按核数（上限 [`MAX_WORKERS`]）切块。
@@ -302,5 +392,64 @@ mod tests {
         let area = total_area(&tris);
         let expected = 100.0 * 100.0 - 20.0 * 20.0 - 20.0 * 20.0;
         assert!((area - expected).abs() < 1e-6, "area = {area}");
+    }
+
+    // ─────────────────────── 自相交环的合法化 ───────────────────────
+
+    /// 蝴蝶结：路径在 (5,5) 处自交叉，两瓣各 25 平方单位。
+    fn bowtie() -> Vec<[f64; 2]> {
+        vec![[0.0, 0.0], [10.0, 10.0], [10.0, 0.0], [0.0, 10.0]]
+    }
+
+    #[test]
+    fn self_intersecting_bowtie_is_detected() {
+        assert!(!ring_is_simple(&bowtie()));
+        assert!(ring_is_simple(&square(10.0, 0.0)));
+        // 闭合环（首尾重复）不影响判定。
+        let mut closed = square(5.0, 0.0);
+        closed.push(closed[0]);
+        assert!(ring_is_simple(&closed));
+        // 相邻边共享端点是正常的；非相邻边共享端点算自接触。
+        let touch = vec![[0.0, 0.0], [10.0, 0.0], [5.0, 0.0], [5.0, 10.0], [0.0, 10.0]];
+        assert!(!ring_is_simple(&touch));
+    }
+
+    #[test]
+    fn bowtie_splits_into_two_simple_parts() {
+        let parts = polygon_parts(&bowtie(), &[]);
+        assert_eq!(parts.len(), 2, "蝴蝶结应拆成两瓣");
+        // 每瓣都是简单环，且总面积 = 两瓣之和（50）。
+        let mut total = 0.0;
+        for (outer, holes) in &parts {
+            assert!(holes.is_empty());
+            assert!(ring_is_simple(outer));
+            let tris = triangulate_one(outer, holes);
+            total += total_area(&tris);
+        }
+        assert!((total - 50.0).abs() < 1e-9, "total = {total}");
+    }
+
+    #[test]
+    fn simple_ring_passes_through_unchanged() {
+        let outer = square(10.0, 0.0);
+        let holes = vec![square(2.0, 4.0)];
+        let parts = polygon_parts(&outer, &holes);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, outer);
+        assert_eq!(parts[0].1, holes);
+    }
+
+    #[test]
+    fn triangulation_of_bowtie_covers_only_valid_area() {
+        // 数字化路径的整体效果：闭合 → 拆分 → 剖分，填充面积只含有效区域。
+        let mut closed = bowtie();
+        closed.push(closed[0]);
+        let parts = polygon_parts(&closed, &[]);
+        let (outers, hole_sets): (Vec<_>, Vec<_>) = parts
+            .iter()
+            .map(|(o, h)| (o.clone(), h.clone()))
+            .unzip();
+        let tris = triangulate_polygons(&outers, &hole_sets);
+        assert!((total_area(&tris) - 50.0).abs() < 1e-9);
     }
 }
